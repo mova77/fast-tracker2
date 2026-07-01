@@ -27,7 +27,7 @@
 #include "ft2_sample_loader.h"
 #include "ft2_tables.h"
 #include "ft2_structs.h"
-#include "mixer/ft2_mix_interpolation.h"
+#include "mixer/ft2_windowed_sinc.h"
 
 static uint32_t logTab[4*12*16], frequencyMulFactor, frequencyDivFactor;
 static uint64_t songTickDuration52fp[(MAX_BPM-MIN_BPM)+1];
@@ -2900,7 +2900,7 @@ void closeReplayer(void)
 		instr[131] = NULL;
 	}
 	
-	freeMixerInterpolationTables();
+	freeWindowedSincTables();
 }
 
 void calcMiscReplayerVars(void)

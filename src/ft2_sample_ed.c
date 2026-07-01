@@ -30,7 +30,6 @@
 #include "ft2_random.h"
 #include "ft2_replayer.h"
 #include "ft2_smpfx.h"
-#include "mixer/ft2_mix_interpolation.h" // SINC_TAPS, SINC_NEGATIVE_TAPS
 
 static const char sharpNote1Char[12] = { 'C', 'C', 'D', 'D', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B' };
 static const char sharpNote2Char[12] = { '-', '#', '-', '#', '-', '-', '#', '-', '#', '-', '#', '-' };

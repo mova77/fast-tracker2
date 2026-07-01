@@ -1,4 +1,4 @@
-// mixer interpolation LUT generator
+// polyphase windowed-sinc LUT generator
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -6,7 +6,7 @@
 #include <math.h>
 #include "../ft2_header.h"
 #include "../ft2_video.h" // showErrorMsgBox()
-#include "ft2_mix_interpolation.h"
+#include "ft2_windowed_sinc.h"
 
 typedef struct
 {
@@ -32,28 +32,14 @@ static sincKernel_t sincKernelConfig[SINC_KERNELS] =
 };
 
 // globalized
-float *fCubicSplineLUT, *fSinc[SINC_KERNELS], *fSinc8[SINC_KERNELS], *fSinc16[SINC_KERNELS];
+float *fSinc[SINC_KERNELS], *fSinc8[SINC_KERNELS], *fSinc16[SINC_KERNELS];
 uint64_t sincRatio1, sincRatio2;
 // ----------
 
-static void calcPolyphaseCubicSplineLUT(float *fOut, int32_t numPhases);
 static bool calcPolyphaseSincLUT(float *fOut, int32_t numTaps, int32_t numPhases, double kaiserBeta, double sincCutoff);
 
-bool setupMixerInterpolationTables(void)
+bool setupWindowedSincTables(void)
 {
-	// cubic spline (4-point)
-
-	fCubicSplineLUT = (float *)malloc(INTRP_PHASES * CUBIC_SPLINE_TAPS * sizeof (float));
-	if (fCubicSplineLUT == NULL)
-	{
-		showErrorMsgBox("Not enough memory!");
-		return false;
-	}
-
-	calcPolyphaseCubicSplineLUT(fCubicSplineLUT, INTRP_PHASES);
-
-	// windowed-sinc (8-point/16-point)
-
 	sincKernel_t *k = sincKernelConfig;
 	for (int32_t i = 0; i < SINC_KERNELS; i++, k++)
 	{
@@ -86,14 +72,8 @@ bool setupMixerInterpolationTables(void)
 	return true;
 }
 
-void freeMixerInterpolationTables(void)
+void freeWindowedSincTables(void)
 {
-	if (fCubicSplineLUT != NULL)
-	{
-		free(fCubicSplineLUT);
-		fCubicSplineLUT = NULL;
-	}
-
 	for (int32_t i = 0; i < SINC_KERNELS; i++)
 	{
 		if (fSinc8[i] != NULL)
@@ -107,28 +87,6 @@ void freeMixerInterpolationTables(void)
 			free(fSinc16[i]);
 			fSinc16[i] = NULL;
 		}
-	}
-}
-
-static void calcPolyphaseCubicSplineLUT(float *fOut, int32_t numPhases)
-{
-	const double phaseMul = 1.0 / numPhases;
-	for (int32_t i = 0; i < numPhases; i++)
-	{
-		const double x1 = i * phaseMul;
-		const double x2 = x1 * x1; // x^2
-		const double x3 = x2 * x1; // x^3
-
-		// Catmull-Rom algorithm (has unity gain)
-		const double t1 = (x1 * -0.5) + (x2 *  1.0) + (x3 * -0.5);
-		const double t2 =               (x2 * -2.5) + (x3 *  1.5) + 1.0;
-		const double t3 = (x1 *  0.5) + (x2 *  2.0) + (x3 * -1.5);
-		const double t4 =               (x2 * -0.5) + (x3 *  0.5);
-
-		*fOut++ = (float)t1; // tap #1 at sample offset -1
-		*fOut++ = (float)t2; // tap #2 at sample offset  0 (center)
-		*fOut++ = (float)t3; // tap #3 at sample offset  1
-		*fOut++ = (float)t4; // tap #4 at sample offset  2
 	}
 }
 

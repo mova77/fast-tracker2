@@ -130,13 +130,23 @@
 /*                       CUBIC SPLINE INTERPOLATION                        */
 /* ----------------------------------------------------------------------- */
 
+// Catmull-Rom algorithm
 #define CUBIC_SPLINE_INTERPOLATION(s, f, scale) \
 { \
-	const float *t = fCubicSplineLUT + (((uint32_t)(f) >> CUBIC_SPLINE_FRACSHIFT) & CUBIC_SPLINE_FRACMASK); \
-	fSample = ((s[-1] * t[0]) + \
-	           ( s[0] * t[1]) + \
-	           ( s[1] * t[2]) + \
-	           ( s[2] * t[3])) * (1.0f / scale); \
+	const int32_t frac31 = (uint32_t)f >> 1; /* reduce from uint32_t to int32_t for fast SIMD usage */ \
+	const float x = frac31 * (1.0f / ((float)INT32_MAX+1.0f)); \
+	\
+	const float v0 = s[-1]; \
+	const float v1 = s[0]; \
+	const float v2 = s[1]; \
+	const float v3 = s[2]; \
+	\
+	const float c1 = v1; \
+	const float c2 = 0.5f * (v2 - v0); \
+	const float c3 = v0 - (2.5f * v1) + (2.0f * v2) - (0.5f * v3); \
+	const float c4 = 0.5f * (v3 - v0) + 1.5f * (v1 - v2); \
+	\
+	fSample = (((c4 * x + c3) * x + c2) * x + c1) * (1.0f / scale); \
 }
 
 #define RENDER_8BIT_SMP_CINTRP \
