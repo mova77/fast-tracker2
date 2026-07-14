@@ -11,3 +11,6 @@ enum
 };
 
 void saveSample(UNICHAR *filenameU, bool saveAsRange);
+
+// headless synchronous sample save (no GUI thread; mirrors saveSampleThread)
+bool saveSampleHeadless(UNICHAR *filenameU, uint8_t instrNr, uint8_t smpNr, int32_t saveMode);

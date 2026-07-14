@@ -7,6 +7,9 @@
 #include <ctype.h>
 #include <stdint.h>
 #include <stdbool.h>
+#ifndef _WIN32
+#include <strings.h>
+#endif
 #ifdef _WIN32
 #include <direct.h>
 #define mcp_getcwd _getcwd
@@ -27,6 +30,8 @@
 #include "ft2_replayer.h"
 #include "ft2_renderer.h"
 #include "ft2_sample_loader.h"
+#include "ft2_sample_saver.h"
+#include "ft2_sample_ed.h"
 #include "ft2_structs.h"
 #include "ft2_tables.h"
 #include "ft2_unicode.h"
@@ -36,9 +41,10 @@
 #define MCP_PROTOCOL_VERSION "2024-11-05"
 #define MCP_SERVER_NAME      "ft2-clone"
 #define MCP_SERVER_VERSION   "1.0"
-#define MCP_MAX_LINE         65536
+#define MCP_MAX_LINE         (256 * 1024)
 #define MCP_MAX_TOKENS       512
 #define MCP_RESULT_BUF       4096
+#define MCP_MAX_PCM_BYTES    (512 * 1024)
 
 static const char *noteNameTab[12] =
 {
@@ -147,6 +153,18 @@ static bool args_get_string(const char *js, const jsmntok_t *toks, int args_idx,
 	if (vidx < 0 || toks[vidx].type != JSMN_STRING)
 		return false;
 	return json_token_string(js, &toks[vidx], out, outSize);
+}
+
+static bool args_get_string_ptr(const char *js, const jsmntok_t *toks, int args_idx,
+	const char *key, const char **outPtr, int *outLen)
+{
+	const int vidx = json_object_find(js, toks, args_idx, key);
+	if (vidx < 0 || toks[vidx].type != JSMN_STRING)
+		return false;
+
+	*outPtr = js + toks[vidx].start;
+	*outLen = toks[vidx].end - toks[vidx].start;
+	return (*outLen >= 0);
 }
 
 static bool args_get_int(const char *js, const jsmntok_t *toks, int args_idx,
@@ -848,6 +866,635 @@ static bool tool_module_render(const char *js, const jsmntok_t *toks, int args_i
 	return true;
 }
 
+/* --- base64 (for sample_create_from_pcm) -------------------------------- */
+
+static int b64_value(int c)
+{
+	if (c >= 'A' && c <= 'Z') return c - 'A';
+	if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+	if (c >= '0' && c <= '9') return c - '0' + 52;
+	if (c == '+') return 62;
+	if (c == '/') return 63;
+	return -1;
+}
+
+static ssize_t b64_decode(const char *in, size_t inLen, uint8_t *out, size_t outCap)
+{
+	size_t o = 0;
+	int val = 0, valb = -8;
+
+	for (size_t i = 0; i < inLen; i++)
+	{
+		const unsigned char c = (unsigned char)in[i];
+		if (c == '=')
+			break;
+		if (isspace(c))
+			continue;
+
+		const int d = b64_value((int)c);
+		if (d < 0)
+			return -1;
+
+		val = (val << 6) | d;
+		valb += 6;
+		if (valb >= 0)
+		{
+			if (o >= outCap)
+				return -1;
+			out[o++] = (uint8_t)((val >> valb) & 0xFF);
+			valb -= 8;
+		}
+	}
+
+	return (ssize_t)o;
+}
+
+static bool parse_instr_sample_args(const char *js, const jsmntok_t *toks, int args_idx,
+	int32_t *instrument, int32_t *sample, char *err, size_t errSize)
+{
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "instrument", instrument, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: instrument");
+		return false;
+	}
+	if (!args_get_int(js, toks, args_idx, "sample", sample, &found))
+	{
+		snprintf(err, errSize, "invalid sample argument");
+		return false;
+	}
+	if (!found)
+		*sample = 0;
+
+	if (*instrument < 1 || *instrument > MAX_INST)
+	{
+		snprintf(err, errSize, "instrument must be 1..%d", MAX_INST);
+		return false;
+	}
+	if (*sample < 0 || *sample >= MAX_SMP_PER_INST)
+	{
+		snprintf(err, errSize, "sample must be 0..%d", MAX_SMP_PER_INST - 1);
+		return false;
+	}
+
+	return true;
+}
+
+/* --- phase-2 tools: song / order ---------------------------------------- */
+
+static bool tool_song_set(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	bool found = false;
+	int32_t val = 0;
+
+	lockMixerCallback();
+
+	if (args_get_int(js, toks, args_idx, "bpm", &val, &found) && found)
+	{
+		if (val < MIN_BPM || val > MAX_BPM)
+		{
+			snprintf(err, errSize, "bpm must be %d..%d", MIN_BPM, MAX_BPM);
+			goto songSetError;
+		}
+		song.BPM = (uint16_t)val;
+		editor.BPM = song.BPM;
+		setMixerBPM(song.BPM);
+	}
+
+	if (args_get_int(js, toks, args_idx, "speed", &val, &found) && found)
+	{
+		if (val < 1 || val > MAX_SPEED)
+		{
+			snprintf(err, errSize, "speed must be 1..%d", MAX_SPEED);
+			goto songSetError;
+		}
+		song.speed = (uint16_t)val;
+		editor.speed = song.speed;
+	}
+
+	if (args_get_int(js, toks, args_idx, "length", &val, &found) && found)
+	{
+		if (val < 1 || val > MAX_ORDERS)
+		{
+			snprintf(err, errSize, "length must be 1..%d", MAX_ORDERS);
+			goto songSetError;
+		}
+		song.songLength = (uint16_t)val;
+		if (song.songLoopStart >= song.songLength)
+			song.songLoopStart = song.songLength - 1;
+		if (song.songPos >= song.songLength)
+			song.songPos = song.songLength - 1;
+		editor.songPos = song.songPos;
+	}
+
+	if (args_get_int(js, toks, args_idx, "loop_start", &val, &found) && found)
+	{
+		if (val < 0 || val >= (int32_t)song.songLength)
+		{
+			snprintf(err, errSize, "loop_start must be 0..%u", song.songLength - 1);
+			goto songSetError;
+		}
+		song.songLoopStart = (uint16_t)val;
+	}
+
+	if (args_get_int(js, toks, args_idx, "channels", &val, &found) && found)
+	{
+		val = normalize_channel_count(val);
+		song.numChannels = val;
+	}
+
+	char name[32];
+	if (args_get_string(js, toks, args_idx, "name", name, sizeof(name)))
+	{
+		strncpy(song.name, name, sizeof(song.name) - 1);
+		song.name[sizeof(song.name) - 1] = '\0';
+	}
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+
+songSetError:
+	unlockMixerCallback();
+	return false;
+}
+
+static bool tool_order_set(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t position = 0, pattern = 0;
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "position", &position, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: position");
+		return false;
+	}
+	if (!args_get_int(js, toks, args_idx, "pattern", &pattern, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: pattern");
+		return false;
+	}
+
+	if (position < 0 || position >= MAX_ORDERS)
+	{
+		snprintf(err, errSize, "position must be 0..%d", MAX_ORDERS - 1);
+		return false;
+	}
+	if (pattern < 0 || pattern > 255)
+	{
+		snprintf(err, errSize, "pattern must be 0..255");
+		return false;
+	}
+
+	lockMixerCallback();
+
+	if (position >= (int32_t)song.songLength)
+	{
+		for (int32_t i = (int32_t)song.songLength; i < position; i++)
+			song.orders[i] = 0;
+		song.songLength = (uint16_t)(position + 1);
+	}
+
+	song.orders[position] = (uint8_t)pattern;
+
+	if (song.songPos == position)
+	{
+		song.pattNum = (uint8_t)pattern;
+		if (pattern < MAX_PATTERNS)
+			song.currNumRows = patternNumRows[pattern];
+	}
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+}
+
+/* --- phase-2 tools: pattern --------------------------------------------- */
+
+static bool tool_pattern_clear(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t pattNum = 0;
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "pattern", &pattNum, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: pattern");
+		return false;
+	}
+	if (pattNum < 0 || pattNum >= MAX_PATTERNS)
+	{
+		snprintf(err, errSize, "pattern must be 0..%d", MAX_PATTERNS - 1);
+		return false;
+	}
+
+	lockMixerCallback();
+
+	if (!allocatePattern((uint16_t)pattNum))
+	{
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate pattern %d", pattNum);
+		return false;
+	}
+
+	memset(pattern[(uint16_t)pattNum], 0,
+		(size_t)patternNumRows[(uint16_t)pattNum] * TRACK_WIDTH);
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+}
+
+static bool tool_pattern_set_length(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t pattNum = 0, rows = 64;
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "pattern", &pattNum, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: pattern");
+		return false;
+	}
+	if (!args_get_int(js, toks, args_idx, "rows", &rows, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: rows");
+		return false;
+	}
+	if (pattNum < 0 || pattNum >= MAX_PATTERNS)
+	{
+		snprintf(err, errSize, "pattern must be 0..%d", MAX_PATTERNS - 1);
+		return false;
+	}
+	if (rows < 1 || rows > MAX_PATT_LEN)
+	{
+		snprintf(err, errSize, "rows must be 1..%d", MAX_PATT_LEN);
+		return false;
+	}
+
+	lockMixerCallback();
+
+	if (!allocatePattern((uint16_t)pattNum))
+	{
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate pattern %d", pattNum);
+		return false;
+	}
+
+	patternNumRows[(uint16_t)pattNum] = (int16_t)rows;
+
+	if (song.pattNum == (uint8_t)pattNum)
+		song.currNumRows = (int16_t)rows;
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+}
+
+static bool tool_cell_clear(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t pattNum = 0, row = 0, channel = 0;
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "pattern", &pattNum, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: pattern");
+		return false;
+	}
+	if (!args_get_int(js, toks, args_idx, "row", &row, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: row");
+		return false;
+	}
+	if (!args_get_int(js, toks, args_idx, "channel", &channel, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: channel");
+		return false;
+	}
+
+	note_t *cell = cell_ptr((uint16_t)pattNum, (uint16_t)row, (uint16_t)channel, err, errSize);
+	if (cell == NULL)
+		return false;
+
+	memset(cell, 0, sizeof(note_t));
+	setSongModifiedFlag();
+	return true;
+}
+
+/* --- phase-2 tools: sample / instrument --------------------------------- */
+
+static bool tool_sample_save(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	char path[PATH_MAX + 1];
+	if (!args_get_string(js, toks, args_idx, "path", path, sizeof(path)))
+	{
+		snprintf(err, errSize, "missing required argument: path");
+		return false;
+	}
+
+	int32_t instrument = 0, sample = 0;
+	if (!parse_instr_sample_args(js, toks, args_idx, &instrument, &sample, err, errSize))
+		return false;
+
+	char format[8] = "wav";
+	(void)args_get_string(js, toks, args_idx, "format", format, sizeof(format));
+
+	int32_t saveMode = SMP_SAVE_MODE_WAV;
+	if (strcasecmp(format, "raw") == 0)
+		saveMode = SMP_SAVE_MODE_RAW;
+	else if (strcasecmp(format, "iff") == 0)
+		saveMode = SMP_SAVE_MODE_IFF;
+	else if (strcasecmp(format, "wav") != 0)
+	{
+		snprintf(err, errSize, "format must be \"wav\", \"iff\", or \"raw\"");
+		return false;
+	}
+
+	if (!saveSampleHeadless(path, (uint8_t)instrument, (uint8_t)sample, saveMode))
+	{
+		snprintf(err, errSize, "failed to save sample (empty sample or I/O error)");
+		return false;
+	}
+
+	return true;
+}
+
+static bool tool_sample_set(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t instrument = 0, sample = 0;
+	if (!parse_instr_sample_args(js, toks, args_idx, &instrument, &sample, err, errSize))
+		return false;
+
+	lockMixerCallback();
+
+	if (instr[instrument] == NULL && !allocateInstr((int16_t)instrument))
+	{
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate instrument %d", instrument);
+		return false;
+	}
+
+	sample_t *s = &instr[instrument]->smp[sample];
+	bool found = false;
+	int32_t val = 0;
+
+	char name[24];
+	if (args_get_string(js, toks, args_idx, "name", name, sizeof(name)))
+	{
+		strncpy(s->name, name, sizeof(s->name) - 1);
+		s->name[sizeof(s->name) - 1] = '\0';
+	}
+
+	if (args_get_int(js, toks, args_idx, "volume", &val, &found) && found)
+	{
+		if (val < 0 || val > 64)
+		{
+			snprintf(err, errSize, "volume must be 0..64");
+			goto sampleSetError;
+		}
+		s->volume = (uint8_t)val;
+	}
+
+	if (args_get_int(js, toks, args_idx, "panning", &val, &found) && found)
+	{
+		if (val < 0 || val > 255)
+		{
+			snprintf(err, errSize, "panning must be 0..255");
+			goto sampleSetError;
+		}
+		s->panning = (uint8_t)val;
+	}
+
+	if (args_get_int(js, toks, args_idx, "finetune", &val, &found) && found)
+	{
+		if (val < -128 || val > 127)
+		{
+			snprintf(err, errSize, "finetune must be -128..127");
+			goto sampleSetError;
+		}
+		s->finetune = (int8_t)val;
+	}
+
+	if (args_get_int(js, toks, args_idx, "relative_note", &val, &found) && found)
+	{
+		if (val < -48 || val > 71)
+		{
+			snprintf(err, errSize, "relative_note must be -48..71");
+			goto sampleSetError;
+		}
+		s->relativeNote = (int8_t)val;
+	}
+
+	if (args_get_int(js, toks, args_idx, "loop_start", &val, &found) && found)
+		s->loopStart = val;
+
+	if (args_get_int(js, toks, args_idx, "loop_length", &val, &found) && found)
+		s->loopLength = val;
+
+	if (args_get_int(js, toks, args_idx, "flags", &val, &found) && found)
+	{
+		if (val < 0 || val > 255)
+		{
+			snprintf(err, errSize, "flags must be 0..255");
+			goto sampleSetError;
+		}
+		s->flags = (uint8_t)val;
+	}
+
+	sanitizeSample(s);
+	fixInstrAndSampleNames((int16_t)instrument);
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+
+sampleSetError:
+	unlockMixerCallback();
+	return false;
+}
+
+static bool tool_sample_create_from_pcm(const char *js, const jsmntok_t *toks, int args_idx,
+	char *out, size_t outSize, char *err, size_t errSize)
+{
+	int32_t instrument = 0, sample = 0;
+	if (!parse_instr_sample_args(js, toks, args_idx, &instrument, &sample, err, errSize))
+		return false;
+
+	const char *pcmB64 = NULL;
+	int pcmB64Len = 0;
+	if (!args_get_string_ptr(js, toks, args_idx, "pcm", &pcmB64, &pcmB64Len))
+	{
+		snprintf(err, errSize, "missing required argument: pcm (base64)");
+		return false;
+	}
+
+	char encoding[16] = "int16";
+	(void)args_get_string(js, toks, args_idx, "encoding", encoding, sizeof(encoding));
+
+	const bool isFloat = (strcasecmp(encoding, "float") == 0 ||
+		strcasecmp(encoding, "float32") == 0);
+	const bool isInt16 = (strcasecmp(encoding, "int16") == 0);
+
+	if (!isFloat && !isInt16)
+	{
+		snprintf(err, errSize, "encoding must be \"int16\" or \"float32\"");
+		return false;
+	}
+
+	uint8_t *decoded = (uint8_t *)malloc(MCP_MAX_PCM_BYTES);
+	if (decoded == NULL)
+	{
+		snprintf(err, errSize, "out of memory");
+		return false;
+	}
+
+	const ssize_t decodedLen = b64_decode(pcmB64, (size_t)pcmB64Len, decoded, MCP_MAX_PCM_BYTES);
+	if (decodedLen < 0)
+	{
+		free(decoded);
+		snprintf(err, errSize, "invalid base64 in pcm");
+		return false;
+	}
+
+	int32_t numSamples = 0;
+	if (isInt16)
+	{
+		if ((decodedLen % 2) != 0)
+		{
+			free(decoded);
+			snprintf(err, errSize, "int16 pcm must have even byte length");
+			return false;
+		}
+		numSamples = (int32_t)(decodedLen / 2);
+	}
+	else
+	{
+		if ((decodedLen % 4) != 0)
+		{
+			free(decoded);
+			snprintf(err, errSize, "float32 pcm must have length divisible by 4");
+			return false;
+		}
+		numSamples = (int32_t)(decodedLen / 4);
+	}
+
+	if (numSamples <= 0 || numSamples > (int32_t)(MAX_SAMPLE_LEN))
+	{
+		free(decoded);
+		snprintf(err, errSize, "pcm sample count out of range");
+		return false;
+	}
+
+	lockMixerCallback();
+
+	if (instr[instrument] == NULL && !allocateInstr((int16_t)instrument))
+	{
+		free(decoded);
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate instrument %d", instrument);
+		return false;
+	}
+
+	freeSample((int16_t)instrument, (int16_t)sample);
+	sample_t *s = &instr[instrument]->smp[sample];
+
+	if (!allocateSmpData(s, numSamples, true))
+	{
+		free(decoded);
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate sample data");
+		return false;
+	}
+
+	s->length = numSamples;
+	s->flags = SAMPLE_16BIT;
+	s->volume = 64;
+	s->panning = 128;
+	s->loopStart = 0;
+	s->loopLength = 0;
+
+	int16_t *dst = (int16_t *)s->dataPtr;
+	if (isInt16)
+		memcpy(dst, decoded, (size_t)decodedLen);
+	else
+	{
+		const float *src = (const float *)decoded;
+		for (int32_t i = 0; i < numSamples; i++)
+		{
+			float v = src[i];
+			if (v > 1.0f) v = 1.0f;
+			if (v < -1.0f) v = -1.0f;
+			dst[i] = (int16_t)(v * 32767.0f);
+		}
+	}
+
+	free(decoded);
+
+	char name[24];
+	if (args_get_string(js, toks, args_idx, "name", name, sizeof(name)))
+	{
+		strncpy(s->name, name, sizeof(s->name) - 1);
+		s->name[sizeof(s->name) - 1] = '\0';
+	}
+
+	sanitizeSample(s);
+	fixSample(s);
+	fixInstrAndSampleNames((int16_t)instrument);
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+
+	snprintf(out, outSize, "{\"instrument\":%d,\"sample\":%d,\"length\":%d}",
+		instrument, sample, numSamples);
+	return true;
+}
+
+static bool tool_instrument_set(const char *js, const jsmntok_t *toks, int args_idx,
+	char *err, size_t errSize)
+{
+	int32_t instrument = 0;
+	bool found = false;
+
+	if (!args_get_int(js, toks, args_idx, "instrument", &instrument, &found) || !found)
+	{
+		snprintf(err, errSize, "missing required argument: instrument");
+		return false;
+	}
+	if (instrument < 1 || instrument > MAX_INST)
+	{
+		snprintf(err, errSize, "instrument must be 1..%d", MAX_INST);
+		return false;
+	}
+
+	lockMixerCallback();
+
+	if (instr[instrument] == NULL && !allocateInstr((int16_t)instrument))
+	{
+		unlockMixerCallback();
+		snprintf(err, errSize, "failed to allocate instrument %d", instrument);
+		return false;
+	}
+
+	char name[24];
+	if (args_get_string(js, toks, args_idx, "name", name, sizeof(name)))
+	{
+		strncpy(song.instrName[instrument], name, sizeof(song.instrName[instrument]) - 1);
+		song.instrName[instrument][sizeof(song.instrName[instrument]) - 1] = '\0';
+	}
+
+	fixInstrAndSampleNames((int16_t)instrument);
+
+	unlockMixerCallback();
+	setSongModifiedFlag();
+	return true;
+}
+
 /* --- MCP protocol handlers ---------------------------------------------- */
 
 static const char *TOOLS_LIST_JSON =
@@ -889,7 +1536,52 @@ static const char *TOOLS_LIST_JSON =
 	"\"bits\":{\"type\":\"integer\"},\"amp\":{\"type\":\"integer\"},"
 	"\"loops\":{\"type\":\"integer\"},\"start\":{\"type\":\"integer\"},"
 	"\"stop\":{\"type\":\"integer\"}},"
-	"\"required\":[\"path\"],\"additionalProperties\":false}}"
+	"\"required\":[\"path\"],\"additionalProperties\":false}},"
+	"{\"name\":\"song_set\",\"description\":\"Set song metadata fields\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"name\":{\"type\":\"string\"},\"bpm\":{\"type\":\"integer\"},"
+	"\"speed\":{\"type\":\"integer\"},\"length\":{\"type\":\"integer\"},"
+	"\"loop_start\":{\"type\":\"integer\"},\"channels\":{\"type\":\"integer\"}},"
+	"\"additionalProperties\":false}},"
+	"{\"name\":\"order_set\",\"description\":\"Set one song order entry\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"position\":{\"type\":\"integer\"},\"pattern\":{\"type\":\"integer\"}},"
+	"\"required\":[\"position\",\"pattern\"],\"additionalProperties\":false}},"
+	"{\"name\":\"pattern_clear\",\"description\":\"Clear all cells in a pattern\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"pattern\":{\"type\":\"integer\"}},\"required\":[\"pattern\"],\"additionalProperties\":false}},"
+	"{\"name\":\"pattern_set_length\",\"description\":\"Set pattern row count\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"pattern\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"}},"
+	"\"required\":[\"pattern\",\"rows\"],\"additionalProperties\":false}},"
+	"{\"name\":\"cell_clear\",\"description\":\"Clear one pattern cell\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"pattern\":{\"type\":\"integer\"},\"row\":{\"type\":\"integer\"},"
+	"\"channel\":{\"type\":\"integer\"}},"
+	"\"required\":[\"pattern\",\"row\",\"channel\"],\"additionalProperties\":false}},"
+	"{\"name\":\"sample_save\",\"description\":\"Save a sample to disk\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"path\":{\"type\":\"string\"},\"instrument\":{\"type\":\"integer\"},"
+	"\"sample\":{\"type\":\"integer\"},\"format\":{\"type\":\"string\",\"enum\":[\"wav\",\"iff\",\"raw\"]}},"
+	"\"required\":[\"path\",\"instrument\"],\"additionalProperties\":false}},"
+	"{\"name\":\"sample_set\",\"description\":\"Set sample metadata\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"instrument\":{\"type\":\"integer\"},\"sample\":{\"type\":\"integer\"},"
+	"\"name\":{\"type\":\"string\"},\"volume\":{\"type\":\"integer\"},"
+	"\"panning\":{\"type\":\"integer\"},\"finetune\":{\"type\":\"integer\"},"
+	"\"relative_note\":{\"type\":\"integer\"},\"loop_start\":{\"type\":\"integer\"},"
+	"\"loop_length\":{\"type\":\"integer\"},\"flags\":{\"type\":\"integer\"}},"
+	"\"required\":[\"instrument\"],\"additionalProperties\":false}},"
+	"{\"name\":\"sample_create_from_pcm\",\"description\":\"Create sample from base64 PCM\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"instrument\":{\"type\":\"integer\"},\"sample\":{\"type\":\"integer\"},"
+	"\"pcm\":{\"type\":\"string\"},\"encoding\":{\"type\":\"string\",\"enum\":[\"int16\",\"float32\"]},"
+	"\"name\":{\"type\":\"string\"}},"
+	"\"required\":[\"instrument\",\"pcm\"],\"additionalProperties\":false}},"
+	"{\"name\":\"instrument_set\",\"description\":\"Set instrument metadata\","
+	"\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+	"\"instrument\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"}},"
+	"\"required\":[\"instrument\"],\"additionalProperties\":false}}"
 	"]}";
 
 static void handle_initialize(const char *id_json)
@@ -1012,6 +1704,58 @@ static void handle_tools_call(const char *js, const jsmntok_t *toks, int root_id
 	else if (strcmp(toolName, "module_render") == 0)
 	{
 		ok = tool_module_render(js, toks, args_idx, out, sizeof(out), err, sizeof(err));
+	}
+	else if (strcmp(toolName, "song_set") == 0)
+	{
+		ok = tool_song_set(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "song updated");
+	}
+	else if (strcmp(toolName, "order_set") == 0)
+	{
+		ok = tool_order_set(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "order updated");
+	}
+	else if (strcmp(toolName, "pattern_clear") == 0)
+	{
+		ok = tool_pattern_clear(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "pattern cleared");
+	}
+	else if (strcmp(toolName, "pattern_set_length") == 0)
+	{
+		ok = tool_pattern_set_length(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "pattern length updated");
+	}
+	else if (strcmp(toolName, "cell_clear") == 0)
+	{
+		ok = tool_cell_clear(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "cell cleared");
+	}
+	else if (strcmp(toolName, "sample_save") == 0)
+	{
+		ok = tool_sample_save(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "sample saved");
+	}
+	else if (strcmp(toolName, "sample_set") == 0)
+	{
+		ok = tool_sample_set(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "sample metadata updated");
+	}
+	else if (strcmp(toolName, "sample_create_from_pcm") == 0)
+	{
+		ok = tool_sample_create_from_pcm(js, toks, args_idx, out, sizeof(out), err, sizeof(err));
+	}
+	else if (strcmp(toolName, "instrument_set") == 0)
+	{
+		ok = tool_instrument_set(js, toks, args_idx, err, sizeof(err));
+		if (ok)
+			snprintf(out, sizeof(out), "instrument updated");
 	}
 	else
 	{

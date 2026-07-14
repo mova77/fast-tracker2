@@ -543,3 +543,29 @@ void saveSample(UNICHAR *filenameU, bool saveAsRange)
 
 	SDL_DetachThread(thread);
 }
+
+// headless synchronous sample save (no GUI thread; mirrors saveSampleThread)
+bool saveSampleHeadless(UNICHAR *filenameU, uint8_t instrNr, uint8_t smpNr, int32_t saveMode)
+{
+	if (filenameU == NULL || instrNr < 1 || instrNr > MAX_INST || smpNr >= MAX_SMP_PER_INST)
+		return false;
+
+	if (instr[instrNr] == NULL ||
+		instr[instrNr]->smp[smpNr].dataPtr == NULL ||
+		instr[instrNr]->smp[smpNr].length == 0)
+		return false;
+
+	editor.curInstr = instrNr;
+	editor.curSmp = smpNr;
+	editor.sampleSaveMode = saveMode;
+	saveRangeFlag = false;
+
+	UNICHAR_STRCPY(editor.tmpFilenameU, filenameU);
+
+	switch (editor.sampleSaveMode)
+	{
+		         case SMP_SAVE_MODE_RAW: return saveRawSample(editor.tmpFilenameU, false);
+		         case SMP_SAVE_MODE_IFF: return saveIFFSample(editor.tmpFilenameU, false);
+		default: case SMP_SAVE_MODE_WAV: return saveWAVSample(editor.tmpFilenameU, false);
+	}
+}
