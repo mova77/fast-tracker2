@@ -645,6 +645,24 @@ modSaveError:
 	return false;
 }
 
+// headless synchronous module save (no GUI thread; mirrors saveMusicThread)
+bool saveModuleHeadless(UNICHAR *filenameU, int32_t saveMode)
+{
+	if (filenameU == NULL)
+		return false;
+
+	pauseAudio();
+
+	bool ok;
+	if (saveMode == 1) // MOD_SAVE_MODE_XM
+		ok = saveXM(filenameU);
+	else
+		ok = saveMOD(filenameU);
+
+	resumeAudio();
+	return ok;
+}
+
 static int32_t saveMusicThread(void *ptr)
 {
 	ASSERT(editor.tmpFilenameU != NULL);
