@@ -19,6 +19,9 @@ void normalize64BitFloatToSigned16Bit(double *dSampleData, uint32_t sampleLength
 bool loadSample(UNICHAR *filenameU, uint8_t sampleSlot, bool loadAsInstrFlag);
 void removeSampleIsLoadingFlag(void);
 
+// headless synchronous sample load into instrument instrNr (1..MAX_INST), sample slot smpNr
+bool loadSampleHeadless(UNICHAR *filenameU, uint8_t instrNr, uint8_t smpNr, bool instrFlag);
+
 // globals for sample loaders
 extern bool loadAsInstrFlag, smpFilenameSet;
 extern char *smpFilename;

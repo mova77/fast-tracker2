@@ -32,3 +32,8 @@ render_result_t render_mod_to_wav(
 
 /* Get human-readable error message */
 const char *render_error_to_string(const render_result_t *result);
+
+/* Initialize the headless engine (audio mixer, replayer, config) exactly once.
+   Shared by the renderer and the MCP authoring interface. Returns false + fills
+   errBuf on failure. */
+bool ft2_headlessEngineInit(char *errBuf, size_t errBufSize);

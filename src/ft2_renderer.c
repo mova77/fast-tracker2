@@ -38,7 +38,7 @@ extern void initializeVars(void);
 
 static bool engineInitialized = false;
 
-static bool ensureEngineInitialized(char *errBuf, size_t errBufSize)
+bool ft2_headlessEngineInit(char *errBuf, size_t errBufSize)
 {
 	if (engineInitialized)
 		return true;
@@ -150,7 +150,7 @@ render_result_t render_mod_to_wav(
 	const bool haveCwd = (render_getcwd(savedCwd, sizeof(savedCwd)) != NULL);
 
 	// --- initialize the engine (once) ---
-	if (!ensureEngineInitialized(result.error_message, sizeof(result.error_message)))
+	if (!ft2_headlessEngineInit(result.error_message, sizeof(result.error_message)))
 		return result;
 
 	if (haveCwd)
