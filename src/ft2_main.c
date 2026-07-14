@@ -41,6 +41,7 @@
 #include "ft2_smpfx.h"
 #include "ft2_cli.h"
 #include "ft2_rest_api.h"
+#include "ft2_mcp.h"
 
 static void print_api_help(void);
 void initializeVars(void); // non-static: also used by the headless renderer
@@ -63,6 +64,9 @@ int main(int argc, char *argv[])
 
 		if (strcmp(argv[1], "--server") == 0)
 			return handle_rest_api_mode(argc, argv);
+
+		if (strcmp(argv[1], "--mcp") == 0)
+			return handle_mcp_mode(argc, argv);
 
 		if (strcmp(argv[1], "--api-help") == 0)
 		{
