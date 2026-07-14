@@ -823,3 +823,159 @@ void rbWavRenderBitDepth32(void)
 	checkRadioButton(RB_WAV_RENDER_BITDEPTH32);
 	WDBitDepth = 32;
 }
+
+// headless song-to-WAV render (no GUI/threads). Reuses the real dump_* helpers
+// and mixer. Returns true on success. Engine must already be initialized and a
+// module loaded. bitDepth must be 16 or 32.
+bool renderModuleToWavFileHeadless(const char *outputPath, uint32_t freq,
+	uint8_t bitDepth, int16_t amp, uint8_t startPos, uint8_t stopPos,
+	uint16_t maxLoops, uint32_t *outTotalSamples)
+{
+	if (outputPath == NULL)
+		return false;
+
+	if (bitDepth != 16 && bitDepth != 32)
+		return false;
+
+	/* Infinite-loop safety net.
+	 *
+	 * The song's own end/loop logic ALWAYS wins first: dump_EndOfTune() stops on
+	 * editor.wavReachedEndFlag, which the replayer sets only when the song plays
+	 * through its full order sequence (line ~2330 in ft2_replayer.c). That already
+	 * honours every authored loop (E6x pattern loops, forward Bxx jumps, "loop N
+	 * times then end", etc.) because those all resolve before the natural end.
+	 *
+	 * This net only catches modules that can NEVER reach that natural end -- e.g. a
+	 * backward Bxx position jump with no exit. We track which (songPos,row) states
+	 * have been played; playback is deterministic, so once we are only revisiting
+	 * already-seen states without discovering any NEW one, the song is provably
+	 * endless. We bail after replaying the known state space `maxLoops` times over.
+	 * maxLoops == 0 disables the net (render until the 2GB size cap). */
+	uint8_t *visitedState = NULL;
+	uint32_t visitedCount = 0;
+	uint64_t rowsSinceNewState = 0;
+	if (maxLoops > 0)
+	{
+		visitedState = (uint8_t *)calloc(256 * 256, sizeof (uint8_t)); // [songPos*256 + row]
+		if (visitedState == NULL)
+			return false;
+	}
+
+	// set render parameters (mirrors the GUI's WAV renderer widgets)
+	WDFrequency = CLAMP(freq, MIN_WAV_RENDER_FREQ, MAX_WAV_RENDER_FREQ);
+	WDBitDepth = bitDepth;
+	WDAmp = amp;
+	WDStartPos = startPos;
+	WDStopPos = stopPos;
+
+	FILE *f = fopen(outputPath, "wb");
+	if (f == NULL)
+		return false;
+
+	fseek(f, sizeof (wavHeader_t), SEEK_SET); // leave room for the header
+
+	pauseAudio();
+
+	if (!dump_Init(WDFrequency, WDAmp, WDStartPos))
+	{
+		resumeAudio();
+		fclose(f);
+		return false;
+	}
+
+	uint32_t sampleCounter = 0;
+	bool overflow = false, renderDone = false;
+	uint64_t tickSamplesFrac = 0;
+	uint64_t bytesInFile = sizeof (wavHeader_t);
+
+	editor.wavReachedEndFlag = false;
+	while (!renderDone)
+	{
+		uint32_t samplesInChunk = 0;
+
+		uint8_t *ptr8 = wavRenderBuffer;
+		for (uint32_t i = 0; i < TICKS_PER_RENDER_CHUNK; i++)
+		{
+			// primary stop: the song's own end/loop logic (respects the author)
+			if (!editor.wavIsRendering || dump_EndOfTune(WDStopPos))
+			{
+				renderDone = true;
+				break;
+			}
+
+			dump_TickReplayer();
+
+			// safety net: bail only if the song is provably endless (see above).
+			// song.tick counts down speed..1, so tick==speed marks a fresh row start
+			// (including a Bxx re-entry to the same row). We register each row start;
+			// once we have replayed the whole known state space maxLoops times over
+			// without visiting any NEW (songPos,row), playback is deterministically
+			// stuck -> stop. Authored loops always reach a new state first.
+			if (visitedState != NULL && song.speed > 0 && song.tick == song.speed)
+			{
+				const int32_t key = ((int32_t)(song.songPos & 0xFF) << 8) | (song.row & 0xFF);
+				if (!visitedState[key])
+				{
+					visitedState[key] = 1;
+					visitedCount++;
+					rowsSinceNewState = 0; // still discovering new territory
+				}
+				else if (++rowsSinceNewState > (uint64_t)visitedCount * maxLoops)
+				{
+					renderDone = true;
+					break; // drop this one redundant tick; the WAV is complete
+				}
+			}
+			uint32_t tickSamples = audio.samplesPerTickInt;
+
+			tickSamplesFrac += audio.samplesPerTickFrac;
+			if (tickSamplesFrac >= BPM_FRAC_SCALE)
+			{
+				tickSamplesFrac &= BPM_FRAC_MASK;
+				tickSamples++;
+			}
+
+			mixReplayerTickToBuffer(tickSamples, ptr8, WDBitDepth);
+
+			tickSamples *= 2; // stereo
+			samplesInChunk += tickSamples;
+			sampleCounter += tickSamples;
+
+			if (WDBitDepth == 16)
+			{
+				ptr8 += tickSamples * sizeof (int16_t);
+				bytesInFile += tickSamples * sizeof (int16_t);
+			}
+			else
+			{
+				ptr8 += tickSamples * sizeof (float);
+				bytesInFile += tickSamples * sizeof (float);
+			}
+
+			if (bytesInFile >= INT32_MAX)
+			{
+				renderDone = true;
+				overflow = true;
+				break;
+			}
+		}
+
+		if (samplesInChunk > 0)
+		{
+			if (WDBitDepth == 16)
+				fwrite(wavRenderBuffer, sizeof (int16_t), samplesInChunk, f);
+			else
+				fwrite(wavRenderBuffer, sizeof (float), samplesInChunk, f);
+		}
+	}
+
+	dump_Close(f, sampleCounter); // writes header, restores engine state, closes f
+	resumeAudio();
+
+	free(visitedState);
+
+	if (outTotalSamples != NULL)
+		*outTotalSamples = sampleCounter;
+
+	return !overflow;
+}

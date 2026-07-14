@@ -11,6 +11,7 @@ bool allocateTmpInstr(int32_t insNum);
 bool allocateTmpPatt(int32_t pattNum, uint16_t numRows);
 void loadMusic(UNICHAR *filenameU);
 bool handleModuleLoadFromArg(int argc, char **argv);
+bool loadModuleFromPathHeadless(const char *path);
 void loadDroppedFile(char *fullPathUTF8);
 void handleLoadMusicEvents(void);
 

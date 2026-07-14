@@ -27,3 +27,9 @@ void pbWavSongEndDown(void);
 void resetWavRenderer(void);
 void rbWavRenderBitDepth16(void);
 void rbWavRenderBitDepth32(void);
+
+// headless song-to-WAV render (no GUI). Engine must be initialized and a module loaded.
+// maxLoops: infinite-loop safety net (0 = disabled). See render_config_t.max_loops.
+bool renderModuleToWavFileHeadless(const char *outputPath, uint32_t freq,
+	uint8_t bitDepth, int16_t amp, uint8_t startPos, uint8_t stopPos,
+	uint16_t maxLoops, uint32_t *outTotalSamples);

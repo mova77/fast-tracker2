@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h> // strcmp()
 #include <time.h>
 #include <math.h> // modf()
 #ifdef _WIN32
@@ -38,8 +39,11 @@
 #include "ft2_structs.h"
 #include "ft2_hpc.h"
 #include "ft2_smpfx.h"
+#include "ft2_cli.h"
+#include "ft2_rest_api.h"
 
-static void initializeVars(void);
+static void print_api_help(void);
+void initializeVars(void); // non-static: also used by the headless renderer
 static void cleanUpAndExit(void); // never call this inside the main loop
 #ifdef __APPLE__
 static void osxSetDirToProgramDirFromArgs(char **argv);
@@ -51,6 +55,22 @@ static void disableWasapi(void);
 
 int main(int argc, char *argv[])
 {
+	// headless API modes: dispatch before any GUI/SDL initialization
+	if (argc > 1)
+	{
+		if (strcmp(argv[1], "--cli") == 0)
+			return handle_cli_mode(argc, argv);
+
+		if (strcmp(argv[1], "--server") == 0)
+			return handle_rest_api_mode(argc, argv);
+
+		if (strcmp(argv[1], "--api-help") == 0)
+		{
+			print_api_help();
+			return 0;
+		}
+	}
+
 #ifdef _WIN32 // test for SSE/SSE2 presence very first, to make sure no SSE/SSE2 code is attempted to be ran
 	if (!SDL_HasSSE())
 	{
@@ -262,7 +282,30 @@ int main(int argc, char *argv[])
 	return 0;
 }
 
-static void initializeVars(void)
+static void print_api_help(void)
+{
+	printf("ft2-clone - headless MOD/module to WAV rendering API\n\n");
+	printf("USAGE:\n");
+	printf("  ft2-clone                            Normal GUI mode\n");
+	printf("  ft2-clone <module>                   Load module in GUI\n");
+	printf("  ft2-clone --cli <command> [args]     Headless CLI mode\n");
+	printf("  ft2-clone --server [port]            REST API server mode (default port 8080)\n");
+	printf("  ft2-clone --api-help                 Show this help\n\n");
+	printf("CLI EXAMPLES:\n");
+	printf("  ft2-clone --cli render song.mod song.wav\n");
+	printf("  ft2-clone --cli render song.mod song.wav --rate 48000 --bits 16\n");
+	printf("  ft2-clone --cli render song.mod song.wav --loops 2\n");
+	printf("  ft2-clone --cli help                 Show detailed CLI help\n\n");
+	printf("REST API EXAMPLES:\n");
+	printf("  ft2-clone --server                   Start on port 8080\n");
+	printf("  ft2-clone --server 9000              Start on port 9000\n\n");
+	printf("REST API ENDPOINTS:\n");
+	printf("  GET  /api/health                     Health check\n");
+	printf("  POST /api/render                     Render module to WAV\n");
+	printf("  GET  /api/download/<filename>        Download rendered WAV\n");
+}
+
+void initializeVars(void)
 {
 	srand((uint32_t)time(NULL));
 
