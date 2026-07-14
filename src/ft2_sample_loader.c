@@ -235,6 +235,35 @@ void removeSampleIsLoadingFlag(void)
 	sampleIsLoading = false;
 }
 
+// headless synchronous sample load: runs loadSampleThread() in-thread (no GUI).
+// loadSampleThread does all the real work; only a UI-cleanup flag is normally
+// deferred to the main loop, which we clear ourselves here.
+bool loadSampleHeadless(UNICHAR *filenameU, uint8_t instrNr, uint8_t smpNr, bool instrFlag)
+{
+	if (filenameU == NULL || instrNr < 1 || instrNr > MAX_INST)
+		return false;
+
+	if (sampleIsLoading)
+		return false;
+
+	loaderMsgBox = myLoaderMsgBoxThreadSafe;
+	loaderSysReq = okBoxThreadSafe;
+
+	editor.curInstr = instrNr;
+	sampleSlot = smpNr;
+	loadAsInstrFlag = instrFlag;
+	sampleIsLoading = true;
+	smpFilenameSet = false;
+
+	memset(&tmpSmp, 0, sizeof (tmpSmp));
+	UNICHAR_STRCPY(editor.tmpFilenameU, filenameU);
+
+	const bool ok = (loadSampleThread(NULL) != 0);
+	sampleIsLoading = false; // main thread normally clears this after the event
+
+	return ok;
+}
+
 bool loadSample(UNICHAR *filenameU, uint8_t smpNr, bool instrFlag)
 {
 	if (sampleIsLoading || filenameU == NULL)
