@@ -19,7 +19,7 @@ VERSION=v`grep PROG_VER_STR src/ft2_header.h|cut -d'"' -f 2`
 RELEASE_MACOS_DIR=release/macos/
 APP_DIR=${RELEASE_MACOS_DIR}ft2-clone-macos.app/
 
-TARGET_X86_64=${APP_DIR}Contents/MacOS/ft2-clone-macos-x86_64
+TARGET_X86_64=${APP_DIR}Contents/MacOS/ft2-clone-macos-arm64
 TARGET_ARM64=${APP_DIR}Contents/MacOS/ft2-clone-macos-arm64
 TARGET_UNIVERSAL=${APP_DIR}Contents/MacOS/ft2-clone-macos
 TARGET_DIR=${APP_DIR}Contents/MacOS/
@@ -36,12 +36,12 @@ fi
 #
 function compile() {
     rm $1 &> /dev/null
-    clang $VERBOSE $CFLAGS -F /Library/Frameworks -g0 -DNDEBUG -DHAS_MIDI -D__MACOSX_CORE__ -stdlib=libc++ src/rtmidi/*.cpp src/gfxdata/*.c src/mixer/*.c src/scopes/*.c src/modloaders/*.c src/smploaders/*.c src/*.c -ffast-math -Winit-self -Wno-deprecated -Wextra -Wunused -mno-ms-bitfields -Wno-missing-field-initializers $LDFLAGS -L /Library/Frameworks -framework SDL2 -framework CoreMidi -framework CoreAudio -framework Cocoa -liconv -lpthread -lm -lstdc++ -o $1
+    clang $VERBOSE $CFLAGS -F /Library/Frameworks -I/opt/homebrew/opt/sdl2-compat/include -I/opt/homebrew/opt/libmicrohttpd/include -g0 -DNDEBUG -DHAS_MIDI -D__MACOSX_CORE__ -stdlib=libc++ src/rtmidi/*.cpp src/gfxdata/*.c src/mixer/*.c src/scopes/*.c src/modloaders/*.c src/smploaders/*.c src/*.c -ffast-math -Winit-self -Wno-deprecated -Wextra -Wunused -mno-ms-bitfields -Wno-missing-field-initializers $LDFLAGS -L /opt/homebrew/opt/sdl2-compat/lib -L/opt/homebrew/opt/libmicrohttpd/lib -L /Library/Frameworks -F/opt/homebrew/opt/sdl2-compat/lib -lSDL2 -framework CoreMidi -framework CoreAudio -framework Cocoa -liconv -lpthread -lm -lstdc++ -lmicrohttpd -o $1
     return $?
 }
 
-echo Compiling x86_64 binary, please wait patiently...
-CFLAGS="-target x86_64-apple-macos10.11 -mmacosx-version-min=10.11 -arch x86_64 -mmmx -mfpmath=sse -msse2 -O3"
+echo Compiling arm64 binary, please wait patiently...
+CFLAGS="-target arm64-apple-macos10.11 -mmacosx-version-min=10.11 -arch arm64 -O3"
 LDFLAGS=
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
 compile $TARGET_X86_64

@@ -289,6 +289,171 @@ static bool loadMusicUnthreaded(UNICHAR *filenameU)
 	return false;
 }
 
+// Headless variant of setupLoadedModule(): copies the freshly loaded module into
+// the live engine state and prepares the replayer/mixer, but performs NONE of the
+// GUI drawing (scrollbars, scopes, top/bottom screen, piano, disk op, ...) that
+// setupLoadedModule() does. Those blit into video.frameBuffer, which is never
+// allocated in headless mode.
+static void setupLoadedModuleHeadless(void)
+{
+	lockMixerCallback();
+
+	freeAllInstr();
+	freeAllPatterns();
+
+	playMode = PLAYMODE_IDLE;
+	songPlaying = false;
+
+#ifdef HAS_MIDI
+	midi.currMIDIVibDepth = 0;
+	midi.currMIDIPitch = 0;
+#endif
+
+	memset(editor.keyOnTab, 0, sizeof (editor.keyOnTab));
+
+	// copy over new pattern pointers and lengths
+	for (int32_t i = 0; i < MAX_PATTERNS; i++)
+	{
+		pattern[i] = patternTmp[i];
+		patternNumRows[i] = patternNumRowsTmp[i];
+	}
+
+	// copy over song struct
+	memcpy(&song, &songTmp, sizeof (song_t));
+	fixSongName();
+
+	// copy over new instruments (includes sample pointers)
+	for (int16_t i = 1; i <= MAX_INST; i++)
+	{
+		instr[i] = instrTmp[i];
+		fixInstrAndSampleNames(i);
+
+		if (instr[i] != NULL)
+		{
+			sanitizeInstrument(instr[i]);
+			for (int32_t j = 0; j < MAX_SMP_PER_INST; j++)
+			{
+				sample_t *s = &instr[i]->smp[j];
+
+				sanitizeSample(s);
+				if (s->dataPtr != NULL)
+					fixSample(s); // prepare sample for branchless linear interpolation
+			}
+		}
+	}
+
+	// support non-even channel numbers
+	if (song.numChannels & 1)
+	{
+		song.numChannels++;
+		if (song.numChannels > MAX_CHANNELS)
+			song.numChannels = MAX_CHANNELS;
+	}
+
+	song.numChannels = CLAMP(song.numChannels, 2, MAX_CHANNELS);
+	song.songLength = CLAMP(song.songLength, 1, MAX_ORDERS);
+	song.BPM = CLAMP(song.BPM, MIN_BPM, MAX_BPM);
+	song.initialSpeed = song.speed = CLAMP(song.speed, 1, MAX_SPEED);
+
+	if (song.songLoopStart >= song.songLength)
+		song.songLoopStart = 0;
+
+	song.globalVolume = 64;
+
+	// remove overflown stuff in pattern data (FT2 doesn't do this)
+	for (int32_t i = 0; i < MAX_PATTERNS; i++)
+	{
+		if (patternNumRows[i] <= 0)
+			patternNumRows[i] = 64;
+
+		if (patternNumRows[i] > MAX_PATT_LEN)
+			patternNumRows[i] = MAX_PATT_LEN;
+
+		if (pattern[i] == NULL)
+			continue;
+
+		note_t *p = pattern[i];
+		for (int32_t j = 0; j < MAX_PATT_LEN * MAX_CHANNELS; j++, p++)
+		{
+			if (p->note > 97)
+				p->note = 0;
+
+			if (p->instr > 128)
+				p->instr = 0;
+
+			if (p->efx > 35)
+			{
+				p->efx = 0;
+				p->efxData = 0;
+			}
+		}
+	}
+
+	resetChannels();
+	setSongPos(0, 0, RESET_SONG_TICK);
+	setMixerBPM(song.BPM);
+
+	editor.tmpPattern = editor.editPattern; // set kludge variable
+	editor.BPM = song.BPM;
+	editor.speed = song.speed;
+	editor.tick = song.tick;
+	editor.globalVolume = song.globalVolume;
+
+	setLinearPeriods(tmpLinearPeriodsFlag);
+
+	unlockMixerCallback();
+
+	resetPlaybackTime();
+
+	moduleFailedToLoad = false;
+	moduleLoaded = false;
+	editor.loadMusicEvent = EVENT_NONE;
+}
+
+// headless module load (for the CLI/REST render API). Loads relative to the
+// current working directory (unlike handleModuleLoadFromArg, which chdir's to
+// the binary path for macOS double-click launches).
+bool loadModuleFromPathHeadless(const char *path)
+{
+	if (path == NULL || path[0] == '\0')
+		return false;
+
+	UNICHAR *filenameU;
+#ifdef _WIN32
+	const int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
+	if (wlen <= 0)
+		return false;
+
+	filenameU = (UNICHAR *)malloc(wlen * sizeof (UNICHAR));
+	if (filenameU == NULL)
+		return false;
+
+	MultiByteToWideChar(CP_UTF8, 0, path, -1, filenameU, wlen);
+#else
+	filenameU = (UNICHAR *)path;
+#endif
+
+	clearTmpModule(); // clear stuff from last loading session (very important)
+	UNICHAR_STRCPY(editor.tmpFilenameU, filenameU);
+
+	editor.loadMusicEvent = EVENT_NONE;
+
+	// pass externalThreadFlag=true so loader warnings use the thread-safe message
+	// box, which no-ops when the GUI main loop isn't running (headless mode) rather
+	// than entering a modal draw loop that would crash without a framebuffer.
+	doLoadMusic(true);
+
+#ifdef _WIN32
+	free(filenameU);
+#endif
+
+	if (!moduleLoaded)
+		return false;
+
+	setupLoadedModuleHeadless();
+	return true;
+}
+
 bool allocateTmpPatt(int32_t pattNum, uint16_t numRows)
 {
 	patternTmp[pattNum] = (note_t *)calloc((MAX_PATT_LEN * TRACK_WIDTH) + 16, 1);
