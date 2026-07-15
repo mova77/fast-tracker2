@@ -1,0 +1,24 @@
+Original composition for the ft2-clone mods collection.
+Inspired by the Amiga game rips in ../ (Lotus 3, Turrican 2, Agony, Shadow of the Beast).
+
+*** Track info ***
+Name: Neon Overdrive
+Format: XM (FastTracker II)
+Composer: ft2-clone MCP (original)
+Channels: 4
+Patterns: 8 x 64 rows
+Song length: 48 orders (loop from position 8)
+BPM: 132, speed 6
+
+*** Structure ***
+P0 intro (sparse) -> P1/P2 driving groove -> P3 chorus hook ->
+P4 atmospheric breakdown -> P5/P6 build -> P3 chorus -> P7 outro
+
+*** Instruments ***
+1 kick, 2 snare, 3 hihat, 4 bass (looped), 5 pad, 6 lead — all synthesized PCM
+
+*** Compose script ***
+../../scripts/compose_neon_overdrive.py (drives ft2-clone --mcp)
+
+*** Collection docs ***
+../README.md — full mods catalog and analysis findings
