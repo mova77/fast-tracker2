@@ -24,3 +24,5 @@ vs2026_project/ft2-clone/Debug/*
 *.iobj
 *.enc
 release/macos/ft2-clone-macos.app/Contents/MacOS/ft2-clone-macos
+__pycache__/
+.claude-flow/

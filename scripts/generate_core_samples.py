@@ -5,15 +5,20 @@ Generate FastTracker II sample disks (Amiga DD–sized volumes).
 Classic Amiga double-density floppy = 880 KiB. Each volume targets that
 budget so a full disk of tracker samples fits the era's mental model.
 
-  volume1/  FT2-Samples-Volume1  — core categories + variants (~880 KiB)
-  volume2/  FT2-Samples-Volume2  — extras, FX, breaks, utilities (~880 KiB)
+  volume1/  FT2-Samples-Volume1  — core categories + variants @ 8363 Hz
+  volume2/  FT2-Samples-Volume2  — extras, FX, breaks, utilities @ 8363 Hz
+  volume3/  FT2-Samples-Volume3  — all-synth hi-res pack @ 16726 Hz (2× C-4)
+  volume4/  FT2-Samples-Volume4  — electro / club remix toolkit @ 16726 Hz (2× C-4)
 
-All files: mono 16-bit PCM WAV @ 8363 Hz (FT2 middle-C / C-4 rate).
+Volumes 1–2: mono 16-bit PCM WAV @ 8363 Hz (FT2 middle-C / C-4 rate).
+Volumes 3–4: mono 16-bit PCM WAV @ 16726 Hz (2× C-4).
 
 Usage:
   python3 scripts/generate_core_samples.py
   python3 scripts/generate_core_samples.py --volume 1
   python3 scripts/generate_core_samples.py --volume 2
+  python3 scripts/generate_core_samples.py --volume 3
+  python3 scripts/generate_core_samples.py --volume 4
   python3 scripts/generate_core_samples.py --out samples --rate 8363
 """
 from __future__ import annotations
@@ -28,6 +33,8 @@ from pathlib import Path
 
 # Classic FT2 / Amiga middle-C sample rate
 C4_RATE = 8363
+# 2× C-4 — Volumes 3–4 hi-res disks
+C4_RATE_2X = C4_RATE * 2  # 16726
 # Amiga DD floppy capacity (KiB)
 AMIGA_DD_KIB = 880
 AMIGA_DD_BYTES = AMIGA_DD_KIB * 1024
@@ -41,13 +48,80 @@ def clamp16(x: float) -> int:
     return int(max(-32767, min(32767, round(x))))
 
 
-def write_wav(path: Path, samples: list[int], rate: int = C4_RATE) -> None:
+def write_wav(
+    path: Path,
+    samples: list[int],
+    rate: int = C4_RATE,
+    *,
+    loop: bool = False,
+    loop_start: int | None = None,
+    loop_end: int | None = None,
+) -> None:
+    """
+    Write mono 16-bit PCM WAV. When loop=True, emit a standard ``smpl`` chunk
+    so ft2-clone/FT2 enable forward loop on load (see ft2_load_wav.c).
+
+    smpl dwEnd is inclusive; FT2 does loopEnd++ then uses exclusive end.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(struct.pack("<" + "h" * len(samples), *samples))
+    n = len(samples)
+    pcm = struct.pack("<" + "h" * n, *samples)
+
+    # fmt chunk (16 bytes PCM)
+    fmt = struct.pack(
+        "<HHIIHH",
+        1,          # PCM
+        1,          # mono
+        rate,
+        rate * 2,   # byte rate
+        2,          # block align
+        16,         # bits
+    )
+    fmt_chunk = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+
+    data_chunk = b"data" + struct.pack("<I", len(pcm)) + pcm
+    if len(pcm) & 1:
+        data_chunk += b"\x00"
+
+    chunks = fmt_chunk + data_chunk
+
+    if loop and n > 0:
+        ls = 0 if loop_start is None else int(loop_start)
+        # inclusive end sample index
+        le = (n - 1) if loop_end is None else int(loop_end)
+        ls = max(0, min(ls, n - 1))
+        le = max(ls, min(le, n - 1))
+        # sample period in nanoseconds
+        period_ns = int(round(1_000_000_000 / rate)) if rate else 0
+        smpl_body = struct.pack(
+            "<9I",
+            0,           # dwManufacturer
+            0,           # dwProduct
+            period_ns,   # dwSamplePeriod
+            60,          # dwMIDIUnityNote = C4
+            0,           # dwMIDIPitchFraction
+            0,           # dwSMPTEFormat
+            0,           # dwSMPTEOffset
+            1,           # cSampleLoops
+            0,           # cbSamplerData
+        )
+        # one loop point (24 bytes)
+        smpl_body += struct.pack(
+            "<6I",
+            0,   # dwIdentifier
+            0,   # dwType = forward
+            ls,  # dwStart
+            le,  # dwEnd (inclusive)
+            0,   # dwFraction
+            0,   # dwPlayCount = infinite
+        )
+        smpl_chunk = b"smpl" + struct.pack("<I", len(smpl_body)) + smpl_body
+        if len(smpl_body) & 1:
+            smpl_chunk += b"\x00"
+        chunks += smpl_chunk
+
+    riff_size = 4 + len(chunks)  # "WAVE" + chunks
+    path.write_bytes(b"RIFF" + struct.pack("<I", riff_size) + b"WAVE" + chunks)
 
 
 def soft_clip(x: float, drive: float = 1.0) -> float:
@@ -434,6 +508,407 @@ def gen_pwm_pad_lead(rate: int, seconds: float = 0.5) -> list[int]:
         # Soften a bit
         s = soft_clip(s * 0.9, 1.0)
         out.append(clamp16(s * 17000))
+    return out
+
+
+def gen_hard_sync_lead(rate: int, seconds: float = 0.45) -> list[int]:
+    """Hard-sync saw lead — oscillator sync ratio sweeps one cycle over the loop."""
+    n, master = seamless_loop_frames(rate, 130.81, seconds)  # C3 master
+    out = []
+    for i in range(n):
+        t = i / rate
+        # Slave ratio 1.5 → 4.0 over the loop (seamless endpoints via sin)
+        ratio = 2.5 + 1.5 * math.sin(2 * math.pi * i / n)
+        # Master phase resets slave
+        mphase = (master * t) % 1.0
+        sphase = (mphase * ratio) % 1.0
+        s = 2.0 * sphase - 1.0  # saw slave
+        s = soft_clip(s, 1.2)
+        out.append(clamp16(s * 18000))
+    return out
+
+
+def gen_ring_mod_lead(rate: int, seconds: float = 0.4) -> list[int]:
+    """Ring-mod metallic lead (carrier × modulator), loop-safe harmonic ratio."""
+    n, car = seamless_loop_frames(rate, 220.0, seconds)
+    # Integer ratio keeps loop closed
+    mod = car * 3
+    out = []
+    for i in range(n):
+        t = i / rate
+        s = math.sin(2 * math.pi * car * t) * math.sin(2 * math.pi * mod * t)
+        s += 0.2 * math.sin(2 * math.pi * car * 2 * t)
+        s *= 0.9 + 0.1 * math.sin(2 * math.pi * i / n)
+        out.append(clamp16(s * 19000))
+    return out
+
+
+def gen_supersaw_loop(rate: int, seconds: float = 0.5, voices: int = 7) -> list[int]:
+    """Multi-voice detuned saw loop (not single-cycle)."""
+    n, f0 = seamless_loop_frames(rate, 130.81, seconds)
+    # Detune as phase offsets that complete integer cycles
+    out = []
+    for i in range(n):
+        t = i / rate
+        s = 0.0
+        for v in range(voices):
+            # cents-like phase drift closed over loop
+            det = (v - voices // 2) * 0.004
+            phase = ((f0 * (1.0 + det)) * t + v * i / n) % 1.0
+            # keep mostly harmonic: use f0 with phase offset only for outer voices
+            if abs(det) < 1e-6:
+                phase = (f0 * t) % 1.0
+            else:
+                phase = (f0 * t + 0.15 * v * math.sin(2 * math.pi * i / n)) % 1.0
+            s += 2.0 * phase - 1.0
+        s /= voices
+        out.append(clamp16(soft_clip(s, 1.1) * 17000))
+    return out
+
+
+def gen_hoover(rate: int, seconds: float = 0.55) -> list[int]:
+    """Hoover / alpha-juno-ish stacked saw with PWM-ish width."""
+    n, f0 = seamless_loop_frames(rate, 110.0, seconds)
+    out = []
+    for i in range(n):
+        t = i / rate
+        s = 0.0
+        for k, mult in enumerate((1, 2, 3, 4)):
+            phase = (f0 * mult * t) % 1.0
+            width = 0.5 + 0.2 * math.sin(2 * math.pi * (k + 1) * i / n)
+            # trapezoid-ish from saw + pulse blend
+            saw = 2.0 * phase - 1.0
+            pulse = 1.0 if phase < width else -1.0
+            s += (saw * 0.6 + pulse * 0.4) / (k + 1)
+        s /= 2.0
+        s *= 0.85 + 0.15 * math.sin(2 * math.pi * i / n)
+        out.append(clamp16(soft_clip(s, 1.4) * 18000))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Electro / club remix toolkit (Volume 4) — dirty, loud, dance-floor
+# ---------------------------------------------------------------------------
+
+def hard_clip(x: float, thr: float = 0.7) -> float:
+    """Aggressive club-style clipping."""
+    if x > thr:
+        return thr + (x - thr) * 0.15
+    if x < -thr:
+        return -thr + (x + thr) * 0.15
+    return x
+
+
+def gen_club_kick(n: int, rate: int, dirty: float = 1.0, seed: int = 1) -> list[int]:
+    """Punchy club kick — deep body + click + optional grit."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        t = i / rate
+        pitch = 48.0 + 140.0 * math.exp(-t * 32.0)
+        body = math.sin(2 * math.pi * pitch * t)
+        click = math.sin(2 * math.pi * 2800 * t) * math.exp(-t * 90) * 0.35
+        dirt = rng.uniform(-1, 1) * math.exp(-t * 40) * 0.12 * dirty
+        env = math.exp(-t * 10.0)
+        s = hard_clip(soft_clip((body + click + dirt) * env, 1.6 + dirty), 0.65)
+        out.append(clamp16(s * 30000))
+    return out
+
+
+def gen_club_tom(n: int, rate: int, base_hz: float = 120.0, dirty: float = 1.0) -> list[int]:
+    """Electronic club tom — pitch drop + mild grit for fills."""
+    out = []
+    for i in range(n):
+        t = i / rate
+        pitch = base_hz * (1.0 + 0.9 * math.exp(-t * 14.0))
+        body = math.sin(2 * math.pi * pitch * t)
+        body += 0.28 * math.sin(2 * math.pi * pitch * 1.5 * t)
+        body += 0.12 * math.sin(2 * math.pi * pitch * 2.2 * t)
+        env = math.exp(-t * 7.5)
+        s = hard_clip(soft_clip(body * env, 1.4 + 0.3 * dirty), 0.7)
+        out.append(clamp16(s * 25000))
+    return out
+
+
+def gen_club_clap(n: int, rate: int, seed: int = 2) -> list[int]:
+    """Stacked electro clap — tight, roomy tail."""
+    rng = random.Random(seed)
+    out, prev = [], 0.0
+    bursts = [0.0, 0.011, 0.022, 0.038, 0.055]
+    for i in range(n):
+        t = i / rate
+        env = 0.0
+        for b in bursts:
+            if t >= b:
+                env += math.exp(-(t - b) * 40.0)
+        env = min(1.2, env * 0.5)
+        hp, prev = highpass_noise(rng, prev, 0.55)
+        tone = math.sin(2 * math.pi * 240 * t) * env * 0.15
+        s = hard_clip((hp * env + tone) * 1.1, 0.75)
+        out.append(clamp16(s * 23000))
+    return out
+
+
+def gen_club_snare(n: int, rate: int, seed: int = 3) -> list[int]:
+    """Snappy rock/electro snare."""
+    rng = random.Random(seed)
+    out, prev = [], 0.0
+    for i in range(n):
+        t = i / rate
+        env = math.exp(-t * 16.0) * (1.0 - math.exp(-t * 300.0))
+        tone = math.sin(2 * math.pi * 200 * t) * env * 0.45
+        tone += math.sin(2 * math.pi * 340 * t) * env * 0.2
+        hp, prev = highpass_noise(rng, prev, 0.65)
+        s = hard_clip((tone + hp * env * 0.95) * 1.2, 0.7)
+        out.append(clamp16(s * 25000))
+    return out
+
+
+def gen_electro_hat(n: int, rate: int, open_: bool = False, seed: int = 4) -> list[int]:
+    """Crisp electro hat — closed or open."""
+    rng = random.Random(seed)
+    decay = 12.0 if open_ else 70.0
+    out, prev = [], 0.0
+    for i in range(n):
+        t = i / rate
+        env = math.exp(-t * decay)
+        hp, prev = highpass_noise(rng, prev, 0.94)
+        metal = sum(
+            math.sin(2 * math.pi * f * t) / (k + 1)
+            for k, f in enumerate((6200, 8800, 10500, 13000))
+        ) * env * 0.1
+        s = hard_clip(hp * env * 0.95 + metal, 0.8)
+        out.append(clamp16(s * 15000))
+    return out
+
+
+def gen_growl_bass(rate: int, seconds: float = 0.45) -> list[int]:
+    """Dirty mid-growl electro bass — saturated saw + sub."""
+    n, f0 = seamless_loop_frames(rate, 55.0, seconds)
+    out = []
+    lp = 0.0
+    for i in range(n):
+        t = i / rate
+        phase = (f0 * t) % 1.0
+        saw = 2.0 * phase - 1.0
+        sub = math.sin(2 * math.pi * f0 * 0.5 * t)
+        # mild resonant peak via feedback
+        lp = lp * 0.75 + saw * 0.25
+        s = hard_clip(soft_clip(saw * 0.7 + lp * 0.5 + sub * 0.35, 2.2), 0.6)
+        s *= 0.92 + 0.08 * math.sin(2 * math.pi * i / n)
+        out.append(clamp16(s * 20000))
+    return out
+
+
+def gen_drive_bass(rate: int, seconds: float = 0.40) -> list[int]:
+    """Driving square/saw club bass."""
+    n, f0 = seamless_loop_frames(rate, 65.41, seconds)
+    out = []
+    for i in range(n):
+        phase = (i * f0 / rate) % 1.0
+        sq = 1.0 if phase < 0.5 else -1.0
+        saw = 2.0 * phase - 1.0
+        s = hard_clip(soft_clip(sq * 0.55 + saw * 0.45, 1.9), 0.55)
+        out.append(clamp16(s * 19000))
+    return out
+
+
+def gen_reese_bass(rate: int, seconds: float = 0.45) -> list[int]:
+    """Detuned dual-saw reese — thick club undercurrent."""
+    n, f0 = seamless_loop_frames(rate, 55.0, seconds)
+    out = []
+    for i in range(n):
+        t = i / rate
+        # Two sines at f0 with opposite slow phase (stays loop-safe)
+        det = 0.012 * math.sin(2 * math.pi * i / n)
+        s = 0.0
+        for mult, amp in ((1, 1.0), (2, 0.35), (3, 0.15)):
+            s += amp * math.sin(2 * math.pi * f0 * mult * t)
+            s += amp * 0.9 * math.sin(2 * math.pi * f0 * mult * t + det * mult * 8)
+        # Soft fold for mid growl
+        s = soft_clip(s / 2.2, 1.6)
+        s *= 0.92 + 0.08 * math.sin(2 * math.pi * i / n)
+        out.append(clamp16(s * 19000))
+    return out
+
+
+def gen_rubber_bass(rate: int, seconds: float = 0.40) -> list[int]:
+    """Rubber / 808-ish sine bass with soft drive — pitchable mono line."""
+    n, f0 = seamless_loop_frames(rate, 49.0, seconds)  # ~G1
+    out = []
+    for i in range(n):
+        t = i / rate
+        # Sine + slight overtone for presence on club systems
+        s = math.sin(2 * math.pi * f0 * t)
+        s += 0.18 * math.sin(2 * math.pi * f0 * 2 * t)
+        # Gentle AM "bounce" (1 cycle over loop) for pumping feel
+        s *= 0.88 + 0.12 * math.sin(2 * math.pi * i / n)
+        s = soft_clip(s, 1.35)
+        out.append(clamp16(s * 22000))
+    return out
+
+
+def gen_acid_scream(rate: int, seconds: float = 0.55) -> list[int]:
+    """High-resonance acid scream — dance-floor filter abuse."""
+    n, freq = seamless_loop_frames(rate, 82.41, seconds)
+    lp = bp = 0.0
+    out = []
+    for i in range(n):
+        phase = (i * freq / rate) % 1.0
+        saw = 2.0 * phase - 1.0
+        # wide cutoff sweep
+        cutoff = 0.05 + 0.55 * (0.5 + 0.5 * math.sin(2 * math.pi * i / n))
+        res = 0.92
+        hp = saw - lp
+        bp = bp + cutoff * hp
+        lp = lp + cutoff * bp
+        bp *= res
+        s = hard_clip(soft_clip(bp * 1.4 + hp * 0.2, 2.5), 0.55)
+        out.append(clamp16(s * 18000))
+    return out
+
+
+def gen_chord_stab(n: int, rate: int, freqs: list[float], drive: float = 1.8) -> list[int]:
+    """Short overdriven synth chord stab."""
+    out = []
+    for i in range(n):
+        t = i / rate
+        env = (1.0 - math.exp(-t * 120.0)) * math.exp(-t * 8.0)
+        s = 0.0
+        for k, f in enumerate(freqs):
+            phase = (f * t) % 1.0
+            saw = 2.0 * phase - 1.0
+            s += saw / (1 + k * 0.2)
+        s = hard_clip(soft_clip(s / len(freqs) * env, drive), 0.6)
+        out.append(clamp16(s * 22000))
+    return out
+
+
+def gen_dist_lead(rate: int, seconds: float = 0.40) -> list[int]:
+    """Overdriven saw lead — rock/electro hybrid."""
+    n, f0 = seamless_loop_frames(rate, 220.0, seconds)
+    out = []
+    for i in range(n):
+        t = i / rate
+        s = 0.0
+        for h in range(1, 8):
+            s += math.sin(2 * math.pi * f0 * h * t) / h
+        # parallel square for grit
+        phase = (f0 * t) % 1.0
+        s = s / 2.5 + (1.0 if phase < 0.5 else -1.0) * 0.35
+        s = hard_clip(soft_clip(s, 2.0), 0.5)
+        s *= 0.9 + 0.1 * math.sin(2 * math.pi * i / n)
+        out.append(clamp16(s * 18000))
+    return out
+
+
+def gen_talkboxish(rate: int, seconds: float = 0.50) -> list[int]:
+    """Formant-filtered saw — talkbox / vocoder-ish lead body."""
+    n, f0 = seamless_loop_frames(rate, 146.83, seconds)
+    # morph between two formant sets over the loop
+    fA = [(500, 1.0), (900, 0.7), (2400, 0.35)]
+    fB = [(300, 1.0), (1600, 0.6), (2800, 0.3)]
+    out = []
+    for i in range(n):
+        t = i / rate
+        morph = 0.5 + 0.5 * math.sin(2 * math.pi * i / n)
+        phase = (f0 * t) % 1.0
+        saw = 2.0 * phase - 1.0
+        s = saw * 0.3
+        for (fa, aa), (fb, ab) in zip(fA, fB):
+            ff = fa * (1 - morph) + fb * morph
+            amp = aa * (1 - morph) + ab * morph
+            s += amp * 0.2 * math.sin(2 * math.pi * ff * t) * (0.5 + 0.5 * saw)
+        s = soft_clip(s, 1.3)
+        out.append(clamp16(s * 16000))
+    return out
+
+
+def gen_noise_build(n: int, rate: int, seed: int = 8) -> list[int]:
+    """Rising white-noise build (filter opens)."""
+    rng = random.Random(seed)
+    out, prev = [], 0.0
+    for i in range(n):
+        t = i / rate
+        pos = i / max(1, n - 1)
+        env = pos ** 1.4
+        hp, prev = highpass_noise(rng, prev, 0.4 + 0.55 * pos)
+        tone = math.sin(2 * math.pi * (150 + 2500 * pos) * t) * env * 0.15
+        s = hard_clip(hp * env * 0.85 + tone, 0.8)
+        out.append(clamp16(s * 16000))
+    return out
+
+
+def gen_impact_drop(n: int, rate: int, seed: int = 9) -> list[int]:
+    """Club drop impact — sub + noise smash."""
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        t = i / rate
+        env = math.exp(-t * 5.0)
+        boom = math.sin(2 * math.pi * (35 + 60 * math.exp(-t * 10)) * t)
+        noise = rng.uniform(-1, 1) * math.exp(-t * 12)
+        s = hard_clip(soft_clip((boom * 0.7 + noise * 0.5) * env, 2.0), 0.55)
+        out.append(clamp16(s * 26000))
+    return out
+
+
+def gen_club_break(rate: int, bpm: float, bars: float = 1.0, seed: int = 20) -> list[int]:
+    """
+    Driving four-on-the-floor club break (kick every beat, clap on 2/4).
+    Loop full sample; match song BPM.
+    """
+    beats = 4 * bars
+    n = int(rate * (60.0 / bpm) * beats)
+    mix = [0.0] * n
+    kick = gen_club_kick(N(rate, 0.32), rate, dirty=1.1, seed=seed)
+    clap = gen_club_clap(N(rate, 0.30), rate, seed=seed + 1)
+    snare = gen_club_snare(N(rate, 0.22), rate, seed=seed + 2)
+    hat_c = gen_electro_hat(N(rate, 0.06), rate, False, seed=seed + 3)
+    hat_o = gen_electro_hat(N(rate, 0.18), rate, True, seed=seed + 4)
+
+    def place(src: list[int], at: int, gain: float = 1.0) -> None:
+        for j, v in enumerate(src):
+            if at + j < n:
+                mix[at + j] += v * gain
+
+    step = n // 16
+    for s in range(16):
+        pos = s * step
+        # 16th hats
+        place(hat_c, pos, 0.45 if s % 2 == 0 else 0.28)
+        # four-on-the-floor kick
+        if s % 4 == 0:
+            place(kick, pos, 1.0)
+        # clap on 2 and 4
+        if s in (4, 12):
+            place(clap, pos, 0.9)
+            if seed % 3 == 0:
+                place(snare, pos, 0.35)
+        # open hat on offbeat 8th sometimes
+        if s in (6, 14):
+            place(hat_o, pos, 0.4)
+        # ghost kick
+        if s == 10 and seed % 2:
+            place(kick, pos, 0.45)
+
+    peak = max(abs(x) for x in mix) or 1.0
+    scale = 29000 / peak
+    return [clamp16(hard_clip(x * scale / 30000, 0.7) * 30000) for x in mix]
+
+
+def gen_bitcrush_stab(n: int, rate: int, freq: float = 130.81) -> list[int]:
+    """Lo-fi crushed stab for electro colour."""
+    out = []
+    for i in range(n):
+        t = i / rate
+        env = math.exp(-t * 10.0)
+        phase = (freq * t) % 1.0
+        s = 1.0 if phase < 0.5 else -1.0
+        s += 0.4 * (2.0 * ((freq * 1.5 * t) % 1.0) - 1.0)
+        # quantize
+        s = round(s * 4) / 4.0
+        out.append(clamp16(s * env * 17000))
     return out
 
 
@@ -939,7 +1414,8 @@ def gen_kalimba(n: int, rate: int, freq: float = 440.0) -> list[int]:
 # Catalogs
 # ---------------------------------------------------------------------------
 
-Item = tuple[str, str, list[int], str]  # category, filename, pcm, description
+# (category, filename, pcm, description) or (+ optional bool loop override)
+Item = tuple
 
 CAT_TITLES_V1 = {
     "01-drums-percussion": "Drums & Percussion",
@@ -955,6 +1431,22 @@ CAT_TITLES_V2 = {
     "04-breaks-loops": "Breaks & Loops",
     "05-utility": "Utility & Test Tones",
     "06-world-misc": "World & Vocal",
+}
+
+CAT_TITLES_V3 = {
+    "01-waves": "Single-Cycle Waves",
+    "02-bass": "Synth Bass",
+    "03-leads": "Synth Leads",
+    "04-pads": "Synth Pads",
+    "05-keys-fm": "Keys & FM",
+}
+
+CAT_TITLES_V4 = {
+    "01-club-drums": "Club Drums",
+    "02-dirty-bass": "Dirty Bass",
+    "03-leads-stabs": "Leads & Stabs",
+    "04-fx-builds": "FX & Builds",
+    "05-grooves": "Grooves & Breaks",
 }
 
 
@@ -1280,6 +1772,276 @@ def build_volume2(rate: int) -> list[Item]:
     return items
 
 
+def build_volume3(rate: int) -> list[Item]:
+    """
+    Disk 3 — all-synth hi-res pack at 2× C-4 (default 16726 Hz).
+
+    Shorter loops than Volumes 1–2 because each second costs 2× bytes.
+    Target ≈ one Amiga DD (880 KiB).
+
+    Waves use many integer cycles (not 1-cycle blips) + smpl forward-loop so
+    they sustain when loaded even if you forget to set loop in Sample Ed.
+    """
+    items: list[Item] = []
+
+    # ~0.25 s of seamless waveform at C4 — long enough to hear & edit,
+    # still tiny on disk; smpl chunk loops the whole buffer.
+    def multi_wave(shape: str, seconds: float = 0.25) -> list[int]:
+        period = max(1, int(round(rate / 261.625565)))
+        cycles = max(8, int(round(rate * seconds / period)))
+        return gen_single_cycle(rate, shape, cycles=cycles)
+
+    w = "01-waves"
+    items += [
+        (w, "wave_sine.wav", multi_wave("sine"),
+         "Sine @ C4 (~0.25s, seamless). Loop full (smpl)."),
+        (w, "wave_saw.wav", multi_wave("saw"),
+         "Saw @ C4 (~0.25s, seamless). Loop full (smpl)."),
+        (w, "wave_square.wav", multi_wave("square"),
+         "Square @ C4 (~0.25s, seamless). Loop full (smpl)."),
+        (w, "wave_pulse25.wav", multi_wave("pulse25"),
+         "25% pulse @ C4 (~0.25s). Loop full (smpl)."),
+        (w, "wave_pulse12.wav", multi_wave("pulse12"),
+         "12.5% pulse @ C4 (~0.25s, SID-like). Loop full (smpl)."),
+        (w, "wave_triangle.wav", multi_wave("triangle"),
+         "Triangle @ C4 (~0.25s). Loop full (smpl)."),
+        (w, "wave_halfsine.wav", multi_wave("halfsine"),
+         "Half-sine @ C4 (~0.25s). Loop full (smpl)."),
+        (w, "wave_supersaw.wav", multi_wave("supersaw", 0.30),
+         "Detuned supersaw (~0.30s). Loop full (smpl)."),
+        (w, "wave_noise.wav", multi_wave("noise", 0.30),
+         "Deterministic noise (~0.30s). Loop full (smpl)."),
+    ]
+
+    b = "02-bass"
+    items += [
+        (b, "analog_bass.wav", gen_analog_bass(rate, 0.40),
+         "Analog saw+square bass. Loop full."),
+        (b, "analog_bass_sub.wav", gen_analog_bass(rate, 0.40, 41.20),
+         "Sub analog bass (E1). Loop full."),
+        (b, "fm_bass.wav", gen_fm_bass(rate, 0.40),
+         "2-op FM bass. Loop full; try rel. note −12."),
+        (b, "fm_bass_metal.wav", gen_fm_bass(rate, 0.40, ratio=3.5, idx0=3.5),
+         "Metallic FM bass. Loop full."),
+        (b, "fm_bass_growl.wav", gen_fm_bass(rate, 0.45, ratio=1.5, idx0=4.5),
+         "Growly FM bass. Loop full."),
+        (b, "acid_bass.wav", gen_acid_bass(rate, 0.50),
+         "303-ish resonant acid bass. Loop full."),
+        (b, "acid_squelch.wav", gen_acid_bass(rate, 0.55),
+         "Longer acid filter cycle. Loop full."),
+        (b, "chip_bass.wav", gen_chip_lead(rate, 0.35),
+         "Chip wave — play down for bass. Loop full."),
+        (b, "hoover_bass.wav", gen_hoover(rate, 0.45),
+         "Hoover stack (play down). Loop full."),
+        (b, "pwm_bass.wav", gen_pwm_pad_lead(rate, 0.40),
+         "PWM body as bass (play down). Loop full."),
+    ]
+
+    ld = "03-leads"
+    items += [
+        (ld, "sid_lead.wav", gen_sid_lead(rate, 0.40),
+         "SID pulse+tri lead. Loop full."),
+        (ld, "chip_lead.wav", gen_chip_lead(rate, 0.35),
+         "8-bit PWM chip lead. Loop full."),
+        (ld, "pwm_lead.wav", gen_pwm_pad_lead(rate, 0.40),
+         "Slow PWM square lead. Loop full."),
+        (ld, "pwm_deep.wav", gen_pwm_pad_lead(rate, 0.45),
+         "Deeper PWM body. Loop full."),
+        (ld, "brass_synth.wav", gen_brass_synth(rate, 0.45),
+         "Synth brass. Loop full."),
+        (ld, "brass_soft.wav", gen_brass_synth(rate, 0.50),
+         "Softer brass. Loop full."),
+        (ld, "hard_sync.wav", gen_hard_sync_lead(rate, 0.40),
+         "Hard-sync saw lead. Loop full."),
+        (ld, "ring_mod.wav", gen_ring_mod_lead(rate, 0.35),
+         "Ring-mod metallic lead. Loop full."),
+        (ld, "supersaw_lead.wav", gen_supersaw_loop(rate, 0.40, 7),
+         "Multi-voice supersaw lead. Loop full."),
+        (ld, "hoover.wav", gen_hoover(rate, 0.45),
+         "Classic hoover / Juno stack. Loop full."),
+        (ld, "theremin.wav", gen_tone_loop(rate, 440.0, 0.40),
+         "Pure sine theremin body. Loop full."),
+        (ld, "sync_octave.wav", gen_hard_sync_lead(rate, 0.35),
+         "Hard-sync variant (use with arps). Loop full."),
+    ]
+
+    p = "04-pads"
+    # Pads are the bulk of the disk budget at 2× rate — keep them compact
+    items += [
+        (p, "pad_warm.wav", gen_pad_warm(rate, 1.05),
+         "Warm detuned pad. Loop full; vol/pan envs."),
+        (p, "pad_choir.wav", gen_pad_choir(rate, 1.10),
+         "Choir formant pad. Loop full."),
+        (p, "pad_dark.wav", gen_pad_dark(rate, 1.10),
+         "Dark low pad. Loop full."),
+        (p, "pad_shimmer.wav", gen_pad_shimmer(rate, 0.95),
+         "High shimmer pad. Loop full."),
+        (p, "pad_strings.wav", gen_pad_strings(rate, 1.05),
+         "String-section pad. Loop full."),
+        (p, "pad_glass.wav", gen_pad_glass(rate, 0.95),
+         "Glass/crystal pad. Loop full."),
+        (p, "pad_drone.wav", gen_pad_drone(rate, 1.15),
+         "Low atmospheric drone. Loop full."),
+        (p, "pad_supersaw.wav", gen_supersaw_loop(rate, 0.85, 7),
+         "Supersaw pad bed. Loop full."),
+    ]
+
+    k = "05-keys-fm"
+    items += [
+        (k, "organ_drawbar.wav", gen_organ(rate, 0.50),
+         "Hammond-ish drawbar organ. Loop full."),
+        (k, "organ_perc.wav", gen_organ(rate, 0.35),
+         "Shorter organ (percussive). Loop full."),
+        (k, "fm_bell.wav", gen_fm_bell(N(rate, 0.70), rate),
+         "Bright FM bell. One-shot."),
+        (k, "fm_bell_low.wav", gen_fm_bell(N(rate, 0.80), rate, fc=220.0, ratio=2.7),
+         "Lower FM bell/chime. One-shot."),
+        (k, "fm_epiano.wav", gen_fm_bell(N(rate, 0.90), rate, fc=261.63, ratio=1.0),
+         "FM electric-piano-ish. One-shot."),
+        (k, "fm_pluck.wav", gen_fm_bell(N(rate, 0.40), rate, fc=330.0, ratio=4.0),
+         "FM pluck. One-shot."),
+        (k, "fm_bell_bright.wav", gen_fm_bell(N(rate, 0.65), rate, fc=523.25, ratio=3.2),
+         "Bright high FM bell. One-shot."),
+        (k, "tone_c4.wav", gen_tone_loop(rate, 261.63, 0.35),
+         "C4 sine reference @ 2× rate. Loop full."),
+        (k, "tone_a440.wav", gen_tone_loop(rate, 440.0, 0.35),
+         "A440 sine reference. Loop full."),
+    ]
+    return items
+
+
+def build_volume4(rate: int) -> list[Item]:
+    """
+    Disk 4 — electro / club remix toolkit at 2× C-4.
+
+    Loud, dirty, dance-floor colours: four-on-the-floor drums, growl bass,
+    overdriven leads, minor stabs, filter builds, club breaks @ 120–130 BPM.
+    Target ≈ one Amiga DD (880 KiB). No artist branding in names or docs.
+    """
+    items: list[Item] = []
+
+    d = "01-club-drums"
+    items += [
+        (d, "kick_club.wav", gen_club_kick(N(rate, 0.40), rate, 1.0, 1),
+         "Punchy club kick. One-shot."),
+        (d, "kick_dirty.wav", gen_club_kick(N(rate, 0.38), rate, 1.6, 2),
+         "Dirtier clipped kick. One-shot."),
+        (d, "kick_tight.wav", gen_club_kick(N(rate, 0.28), rate, 1.2, 3),
+         "Tight dance kick. One-shot."),
+        (d, "clap_stack.wav", gen_club_clap(N(rate, 0.40), rate, 10),
+         "Stacked electro clap. One-shot."),
+        (d, "clap_room.wav", gen_club_clap(N(rate, 0.55), rate, 11),
+         "Roomier clap. One-shot."),
+        (d, "snare_snap.wav", gen_club_snare(N(rate, 0.30), rate, 12),
+         "Snappy rock/electro snare. One-shot."),
+        (d, "snare_gate.wav", gen_club_snare(N(rate, 0.18), rate, 13),
+         "Gated short snare. One-shot."),
+        (d, "hat_closed.wav", gen_electro_hat(N(rate, 0.08), rate, False, 14),
+         "Crisp closed electro hat. One-shot."),
+        (d, "hat_open.wav", gen_electro_hat(N(rate, 0.35), rate, True, 15),
+         "Open electro hat. One-shot."),
+        (d, "hat_pedal.wav", gen_electro_hat(N(rate, 0.14), rate, False, 16),
+         "Pedal / tight hat. One-shot."),
+        (d, "rim_click.wav", gen_rim(N(rate, 0.06), rate, 17),
+         "Rim / stick click. One-shot."),
+        (d, "tom_low.wav", gen_club_tom(N(rate, 0.38), rate, 85.0, 1.1),
+         "Low club tom fill. One-shot."),
+        (d, "tom_high.wav", gen_club_tom(N(rate, 0.30), rate, 180.0, 1.0),
+         "High club tom fill. One-shot."),
+    ]
+
+    b = "02-dirty-bass"
+    items += [
+        (b, "bass_growl.wav", gen_growl_bass(rate, 0.42),
+         "Dirty mid-growl electro bass. Loop full."),
+        (b, "bass_drive.wav", gen_drive_bass(rate, 0.40),
+         "Driving square/saw club bass. Loop full."),
+        (b, "bass_acid.wav", gen_acid_scream(rate, 0.50),
+         "High-resonance acid bass/scream. Loop full."),
+        (b, "bass_sub.wav", gen_analog_bass(rate, 0.40, 41.20),
+         "Sub underlayer (E1). Loop full."),
+        (b, "bass_hoover.wav", gen_hoover(rate, 0.42),
+         "Hoover stack — play down for bass. Loop full."),
+        (b, "bass_fm_grit.wav", gen_fm_bass(rate, 0.42, ratio=2.5, idx0=4.0),
+         "Gritty FM bass. Loop full."),
+        (b, "bass_pwm.wav", gen_pwm_pad_lead(rate, 0.40),
+         "PWM body as bass (play down). Loop full."),
+        (b, "bass_reese.wav", gen_reese_bass(rate, 0.42),
+         "Detuned dual-saw reese undercurrent. Loop full."),
+        (b, "bass_rubber.wav", gen_rubber_bass(rate, 0.40),
+         "Rubber / 808-ish sine mono bass. Loop full."),
+    ]
+
+    # Minor / modal stabs typical of indie-dance remixes
+    stab_cm = [130.81, 155.56, 196.00, 261.63]       # Cm
+    stab_gm = [98.00, 116.54, 146.83, 196.00]        # Gm
+    stab_f = [87.31, 110.00, 130.81, 174.61]         # Fm-ish
+    stab_power = [82.41, 123.47, 164.81]             # power chord-ish E
+
+    ld = "03-leads-stabs"
+    items += [
+        (ld, "lead_dist.wav", gen_dist_lead(rate, 0.40),
+         "Overdriven saw/square lead. Loop full."),
+        (ld, "lead_talk.wav", gen_talkboxish(rate, 0.48),
+         "Talkbox/formant lead body. Loop full."),
+        (ld, "lead_sync.wav", gen_hard_sync_lead(rate, 0.40),
+         "Hard-sync aggressive lead. Loop full."),
+        (ld, "lead_supersaw.wav", gen_supersaw_loop(rate, 0.40, 7),
+         "Stacked supersaw lead. Loop full."),
+        (ld, "lead_ring.wav", gen_ring_mod_lead(rate, 0.35),
+         "Metallic ring-mod lead. Loop full."),
+        (ld, "stab_cm.wav", gen_chord_stab(N(rate, 0.45), rate, stab_cm),
+         "Minor chord stab (Cm). One-shot."),
+        (ld, "stab_gm.wav", gen_chord_stab(N(rate, 0.42), rate, stab_gm),
+         "Minor chord stab (Gm). One-shot."),
+        (ld, "stab_fm.wav", gen_chord_stab(N(rate, 0.42), rate, stab_f),
+         "Dark minor stab. One-shot."),
+        (ld, "stab_power.wav", gen_chord_stab(N(rate, 0.40), rate, stab_power, 2.2),
+         "Power-chord style stab. One-shot."),
+        (ld, "stab_crush.wav", gen_bitcrush_stab(N(rate, 0.35), rate, 130.81),
+         "Bitcrushed lo-fi stab. One-shot."),
+        (ld, "stab_crush_hi.wav", gen_bitcrush_stab(N(rate, 0.30), rate, 196.00),
+         "Higher crushed stab. One-shot."),
+        (ld, "synth_blip.wav", gen_bitcrush_stab(N(rate, 0.12), rate, 261.63),
+         "Short crushed synth blip / fill. One-shot."),
+    ]
+
+    fx = "04-fx-builds"
+    items += [
+        (fx, "build_noise.wav", gen_noise_build(N(rate, 1.0), rate, 8),
+         "Rising noise build / filter open. One-shot."),
+        (fx, "build_noise_short.wav", gen_noise_build(N(rate, 0.50), rate, 18),
+         "Short noise riser. One-shot."),
+        (fx, "drop_impact.wav", gen_impact_drop(N(rate, 0.60), rate, 9),
+         "Club drop impact (sub + smash). One-shot."),
+        (fx, "whoosh_up.wav", gen_whoosh(N(rate, 0.55), rate, 21),
+         "Whoosh rising. One-shot."),
+        (fx, "whoosh_down.wav", list(reversed(gen_whoosh(N(rate, 0.50), rate, 22))),
+         "Whoosh falling. One-shot."),
+        (fx, "reverse_cym.wav", gen_reverse_cymbal(N(rate, 0.75), rate, 23),
+         "Reverse cymbal swell. One-shot."),
+        (fx, "laser_hit.wav", gen_laser(N(rate, 0.30), rate),
+         "Zap / laser hit. One-shot."),
+        (fx, "noise_hit.wav", gen_noise_burst(N(rate, 0.18), rate, 25, 24),
+         "Short noise hit. One-shot."),
+    ]
+
+    g = "05-grooves"
+    items += [
+        (g, "groove_120.wav", gen_club_break(rate, 120, 1.0, 30),
+         "1-bar four-on-floor @ 120 BPM. Loop full."),
+        (g, "groove_125.wav", gen_club_break(rate, 125, 1.0, 31),
+         "1-bar four-on-floor @ 125 BPM. Loop full."),
+        (g, "groove_128.wav", gen_club_break(rate, 128, 1.0, 32),
+         "1-bar four-on-floor @ 128 BPM. Loop full."),
+        (g, "groove_130.wav", gen_club_break(rate, 130, 1.0, 33),
+         "1-bar four-on-floor @ 130 BPM. Loop full."),
+        (g, "groove_128_var.wav", gen_club_break(rate, 128, 1.0, 35),
+         "1-bar variant @ 128 BPM (ghost kick). Loop full."),
+    ]
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Write + docs
 # ---------------------------------------------------------------------------
@@ -1289,8 +2051,19 @@ def pcm_bytes(items: list[Item]) -> int:
     return sum(len(pcm) * 2 + 44 for _, _, pcm, _ in items)
 
 
+def item_should_loop(desc: str, explicit: bool | None = None) -> bool:
+    if explicit is not None:
+        return explicit
+    d = desc.lower()
+    if "one-shot" in d:
+        return False
+    if "loop full" in d or "loop entire" in d or "forward loop" in d:
+        return True
+    return False
+
+
 def write_volume(root: Path, volume_name: str, title: str, blurb: list[str],
-                 items: list[Item], cat_titles: dict[str, str], rate: int) -> int:
+                 items: list, cat_titles: dict[str, str], rate: int) -> int:
     vol = root / volume_name
     if vol.exists():
         shutil.rmtree(vol)
@@ -1298,12 +2071,19 @@ def write_volume(root: Path, volume_name: str, title: str, blurb: list[str],
 
     by_cat: dict[str, list[tuple[str, str, int]]] = {}
     total = 0
-    for cat, name, pcm, desc in items:
+    for entry in items:
+        if len(entry) == 5:
+            cat, name, pcm, desc, loop_flag = entry
+            do_loop = item_should_loop(desc, loop_flag)
+        else:
+            cat, name, pcm, desc = entry
+            do_loop = item_should_loop(desc)
         path = vol / cat / name
-        write_wav(path, pcm, rate)
+        write_wav(path, pcm, rate, loop=do_loop)
         by_cat.setdefault(cat, []).append((name, desc, len(pcm)))
         total += path.stat().st_size
-        print(f"  wrote {volume_name}/{cat}/{name}  ({len(pcm)} frames)")
+        loop_tag = " [loop]" if do_loop else ""
+        print(f"  wrote {volume_name}/{cat}/{name}  ({len(pcm)} frames){loop_tag}")
 
     lines = [
         f"# {title}",
@@ -1338,6 +2118,15 @@ def write_volume(root: Path, volume_name: str, title: str, blurb: list[str],
         "4. Pads: Instr. Ed. volume + panning envelopes for attack/width",
         "",
     ]
+    if rate == C4_RATE_2X:
+        lines += [
+            "## Note on 2× C-4 rate",
+            "",
+            f"These samples are recorded at **{rate} Hz** (2 × {C4_RATE}).",
+            "ft2-clone retunes relative note / finetune on load so C-4 still",
+            "plays at concert pitch — you get cleaner highs without manual retuning.",
+            "",
+        ]
     (vol / "README.md").write_text("\n".join(lines), encoding="utf-8")
     return total
 
@@ -1345,22 +2134,29 @@ def write_volume(root: Path, volume_name: str, title: str, blurb: list[str],
 def write_root_readme(root: Path, sizes: dict[str, tuple[int, int]], rate: int) -> None:
     v1_bytes, v1_n = sizes.get("volume1", (0, 0))
     v2_bytes, v2_n = sizes.get("volume2", (0, 0))
+    v3_bytes, v3_n = sizes.get("volume3", (0, 0))
+    v4_bytes, v4_n = sizes.get("volume4", (0, 0))
+    total_bytes = v1_bytes + v2_bytes + v3_bytes + v4_bytes
+    total_n = v1_n + v2_n + v3_n + v4_n
     lines = [
         "# FT2 Sample Disks",
         "",
-        "Two Amiga double-density–sized sample packs for **ft2-clone / FastTracker II**.",
+        "Amiga double-density–sized sample packs for **ft2-clone / FastTracker II**.",
         "A classic Amiga DD floppy holds **880 KiB** — each volume targets that budget",
         "so a full “disk” of instruments matches the era’s workflow.",
         "",
-        "| Volume | Folder | Role | Samples | Size | Fill |",
-        "|--------|--------|------|---------|------|------|",
-        f"| **Volume 1** | [`volume1/`](volume1/) | Core categories + variants | {v1_n} | "
+        "| Volume | Folder | Role | Rate | Samples | Size | Fill |",
+        "|--------|--------|------|------|---------|------|------|",
+        f"| **Volume 1** | [`volume1/`](volume1/) | Core categories + variants | {C4_RATE} Hz | {v1_n} | "
         f"{v1_bytes/1024:.0f} KiB | {100*v1_bytes/AMIGA_DD_BYTES:.0f}% |",
-        f"| **Volume 2** | [`volume2/`](volume2/) | FX, breaks, utils, world | {v2_n} | "
+        f"| **Volume 2** | [`volume2/`](volume2/) | FX, breaks, utils, world | {C4_RATE} Hz | {v2_n} | "
         f"{v2_bytes/1024:.0f} KiB | {100*v2_bytes/AMIGA_DD_BYTES:.0f}% |",
+        f"| **Volume 3** | [`volume3/`](volume3/) | All-synth hi-res | {C4_RATE_2X} Hz | {v3_n} | "
+        f"{v3_bytes/1024:.0f} KiB | {100*v3_bytes/AMIGA_DD_BYTES:.0f}% |",
+        f"| **Volume 4** | [`volume4/`](volume4/) | Electro / club remix toolkit | {C4_RATE_2X} Hz | {v4_n} | "
+        f"{v4_bytes/1024:.0f} KiB | {100*v4_bytes/AMIGA_DD_BYTES:.0f}% |",
         "",
-        f"**Combined:** {(v1_bytes+v2_bytes)/1024:.0f} KiB · {v1_n+v2_n} samples · "
-        f"{rate} Hz mono 16-bit",
+        f"**Combined:** {total_bytes/1024:.0f} KiB · {total_n} samples · mono 16-bit",
         "",
         "## Volume 1 — Core Instrument Disk",
         "",
@@ -1389,23 +2185,54 @@ def write_root_readme(root: Path, sizes: dict[str, tuple[int, int]], rate: int) 
         "",
         "See [`volume2/README.md`](volume2/README.md).",
         "",
+        "## Volume 3 — All-Synth Hi-Res Disk (2× C-4)",
+        "",
+        f"Pure synthesis only, sampled at **{C4_RATE_2X} Hz** (2 × classic C-4 rate)",
+        "for cleaner highs and smoother loops. Categories:",
+        "",
+        "- **Single-cycle waves** — sine/saw/square/pulse/tri/supersaw/noise",
+        "- **Synth bass** — analog, FM, acid, chip, hoover",
+        "- **Synth leads** — SID, PWM, brass, hard-sync, ring-mod, supersaw, hoover",
+        "- **Synth pads** — warm/choir/dark/shimmer/strings/glass/drone/supersaw",
+        "- **Keys & FM** — organ, FM bell/epiano/pluck, reference tones",
+        "",
+        "See [`volume3/README.md`](volume3/README.md).",
+        "",
+        "## Volume 4 — Electro / Club Remix Toolkit (2× C-4)",
+        "",
+        f"Dance-floor remix colours at **{C4_RATE_2X} Hz** — loud, dirty, four-on-the-floor:",
+        "",
+        "- **Club drums** — clipped kicks, stacked claps, snappy snares, electro hats",
+        "- **Dirty bass** — growl, drive, acid scream, sub, hoover, FM grit",
+        "- **Leads & stabs** — overdriven lead, talkbox body, minor/power stabs, bitcrush",
+        "- **FX & builds** — noise risers, drop impacts, whooshes, reverse cymbal",
+        "- **Grooves** — 1-bar club breaks @ 120–130 BPM (loop full; match song BPM)",
+        "",
+        "Looped material ships with embedded WAV `smpl` forward-loop markers.",
+        "",
+        "See [`volume4/README.md`](volume4/README.md).",
+        "",
         "## Loop cheat-sheet",
         "",
         "| Kind | Loop? | Tip |",
         "|------|-------|-----|",
         "| Drum one-shots | No | — |",
-        "| Single-cycle waves | Yes, full sample | Rel. note 0 @ 8363 Hz |",
-        "| Synth multi / pads | Yes, full sample | Bass: rel. note −12/−24 |",
-        "| Break loops | Yes, full sample | Match song BPM to break BPM |",
+        f"| Waveforms (Vol 3) | Yes — **smpl loop embedded** | ~0.25s multi-cycle + forward loop on load |",
+        f"| Single-cycle waves | Yes, full sample | Rel. note 0 @ {C4_RATE} Hz; Vol 3–4 auto-tune from {C4_RATE_2X} Hz |",
+        "| Synth multi / pads / bass | Yes, full sample | Bass: rel. note −12/−24 |",
+        "| Club grooves / breaks | Yes, full sample | Match song BPM to groove BPM |",
         "| Noise / tones | Yes, full sample | Utility & beds |",
         "| Acoustic strikes | No | Piano, pizz, guitar, orch… |",
+        "| FM bells / stabs / FX | No (one-shots) | — |",
         "",
         "## Regeneration",
         "",
         "```bash",
-        "python3 scripts/generate_core_samples.py           # both volumes",
+        "python3 scripts/generate_core_samples.py           # all volumes",
         "python3 scripts/generate_core_samples.py --volume 1",
         "python3 scripts/generate_core_samples.py --volume 2",
+        "python3 scripts/generate_core_samples.py --volume 3  # 2× rate all-synth",
+        "python3 scripts/generate_core_samples.py --volume 4  # 2× rate club remix toolkit",
         "```",
         "",
         "Generated by `scripts/generate_core_samples.py`.",
@@ -1418,9 +2245,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Generate FT2 Amiga-disk sample volumes")
     ap.add_argument("--out", type=Path,
                     default=Path(__file__).resolve().parents[1] / "samples")
-    ap.add_argument("--rate", type=int, default=C4_RATE)
-    ap.add_argument("--volume", type=int, choices=[1, 2], default=None,
-                    help="Generate only volume 1 or 2 (default: both)")
+    ap.add_argument("--rate", type=int, default=C4_RATE,
+                    help=f"Base rate for volumes 1–2 (default {C4_RATE}). "
+                         f"Volume 3 always uses 2× this rate.")
+    ap.add_argument("--volume", type=int, choices=[1, 2, 3, 4], default=None,
+                    help="Generate only volume 1–4 (default: all)")
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -1433,6 +2262,8 @@ def main() -> None:
             print(f"  removed legacy {old}/")
 
     sizes: dict[str, tuple[int, int]] = {}
+    rate_v3 = args.rate * 2
+    rate_v4 = rate_v3
 
     if args.volume in (None, 1):
         print("=== Volume 1 (core) ===")
@@ -1468,9 +2299,46 @@ def main() -> None:
         print(f"  volume2 total: {nbytes/1024:.1f} KiB "
               f"({100*nbytes/AMIGA_DD_BYTES:.0f}% of {AMIGA_DD_KIB} KiB)")
 
+    if args.volume in (None, 3):
+        print(f"=== Volume 3 (all-synth @ {rate_v3} Hz = 2× C-4) ===")
+        items = build_volume3(rate_v3)
+        est = pcm_bytes(items)
+        print(f"  catalog: {len(items)} samples, ~{est/1024:.0f} KiB estimated")
+        nbytes = write_volume(
+            args.out, "volume3", "FT2-Samples-Volume3",
+            [
+                "All-synth hi-res disk — waves, bass, leads, pads, keys/FM only.",
+                f"Sample rate **{rate_v3} Hz** (2 × classic C-4 {args.rate} Hz).",
+                f"Sized for one **Amiga DD floppy ({AMIGA_DD_KIB} KiB)**.",
+            ],
+            items, CAT_TITLES_V3, rate_v3,
+        )
+        sizes["volume3"] = (nbytes, len(items))
+        print(f"  volume3 total: {nbytes/1024:.1f} KiB "
+              f"({100*nbytes/AMIGA_DD_BYTES:.0f}% of {AMIGA_DD_KIB} KiB)")
+
+    if args.volume in (None, 4):
+        print(f"=== Volume 4 (electro/club remix @ {rate_v4} Hz = 2× C-4) ===")
+        items = build_volume4(rate_v4)
+        est = pcm_bytes(items)
+        print(f"  catalog: {len(items)} samples, ~{est/1024:.0f} KiB estimated")
+        nbytes = write_volume(
+            args.out, "volume4", "FT2-Samples-Volume4",
+            [
+                "Electro / club remix toolkit — dirty drums, growl bass, stabs,",
+                "builds, and four-on-the-floor grooves.",
+                f"Sample rate **{rate_v4} Hz** (2 × classic C-4 {args.rate} Hz).",
+                f"Sized for one **Amiga DD floppy ({AMIGA_DD_KIB} KiB)**.",
+            ],
+            items, CAT_TITLES_V4, rate_v4,
+        )
+        sizes["volume4"] = (nbytes, len(items))
+        print(f"  volume4 total: {nbytes/1024:.1f} KiB "
+              f"({100*nbytes/AMIGA_DD_BYTES:.0f}% of {AMIGA_DD_KIB} KiB)")
+
     # If only one volume requested, still refresh root readme with whatever exists
     if args.volume is not None:
-        for vol in ("volume1", "volume2"):
+        for vol in ("volume1", "volume2", "volume3", "volume4"):
             if vol in sizes:
                 continue
             vpath = args.out / vol
